@@ -277,6 +277,223 @@ flowchart TB
 
 ---
 
+### 5. Логическая схема БД
+
+**Схема:**
+
+Пунктиром отмечены кэши и буферы
+
+```mermaid
+erDiagram
+    users ||--o{ sessions : "входит"
+    users ||--o{ dialogs : "создает"
+    dialogs ||--o{ messages : "содержит"
+    messages ||--o{ attachments : "прикреплены"
+    attachments }o--|| blobs : "содержимое"
+    model_versions ||--o{ messages : "сгенерировала"
+    messages ||--o{ training_samples : "отобраны"
+    datasets ||--o{ training_samples : "включает"
+    datasets }o--|| blobs : "файлы датасета"
+    datasets ||--o{ training_runs : "используется"
+    training_runs ||--o| model_versions : "создает"
+    model_versions }o--|| blobs : "веса адаптера"
+    model_versions ||--o{ evaluations : "оценена"
+
+    dialogs ||..o| dialog_context_cache : "контекст"
+    dialogs ||..o| kv_cache : "KV-кэш"
+    messages ||..o| stream_buffer : "генерация"
+    users ||..o{ rate_limits : "лимиты"
+    users ||..o{ upload_buffer : "загрузка"
+
+    users {
+        uuid user_id PK
+        string login UK
+        string password_hash
+        string name
+        json settings
+        bool allow_training
+        timestamp created_at
+    }
+    sessions {
+        string token_hash PK
+        uuid user_id FK
+        string device
+        string ip
+        timestamp created_at
+        timestamp expires_at
+    }
+    dialogs {
+        uuid dialog_id PK
+        uuid user_id FK
+        string title
+        bool is_deleted
+        timestamp created_at
+        timestamp updated_at
+    }
+    messages {
+        uuid message_id PK
+        uuid dialog_id FK
+        int seq
+        enum role "user / assistant / tool"
+        text content
+        enum status "generating / done / error"
+        int tokens
+        uuid model_version_id FK
+        timestamp created_at
+    }
+    attachments {
+        uuid attachment_id PK
+        uuid message_id FK
+        enum kind "file / voice_in / voice_out"
+        string object_key FK
+        string mime_type
+        string original_name
+        int size
+        timestamp created_at
+    }
+    blobs {
+        string object_key PK
+        bytes data
+        int size
+        string checksum
+        timestamp created_at
+    }
+    model_versions {
+        uuid model_version_id PK
+        string base_model
+        string adapter_object_key FK
+        enum status "training / evaluating / published / archived"
+        timestamp published_at
+    }
+    training_samples {
+        uuid sample_id PK
+        uuid dataset_id FK
+        uuid request_message_id FK
+        uuid response_message_id FK
+    }
+    datasets {
+        uuid dataset_id PK
+        int version
+        enum stage "raw / clean / tokenized"
+        string object_key FK
+        int size
+        timestamp created_at
+    }
+    training_runs {
+        uuid run_id PK
+        uuid dataset_id FK
+        uuid result_model_version_id FK
+        json params
+        enum status
+        timestamp started_at
+        timestamp finished_at
+    }
+    evaluations {
+        uuid evaluation_id PK
+        uuid model_version_id FK
+        string metric
+        float value
+        timestamp created_at
+    }
+    dialog_context_cache {
+        uuid dialog_id PK
+        json last_messages
+        timestamp expires_at
+    }
+    kv_cache {
+        uuid dialog_id PK
+        bytes tensors
+        int tokens
+        timestamp expires_at
+    }
+    stream_buffer {
+        uuid message_id PK
+        text chunks
+        int last_chunk_seq
+        timestamp expires_at
+    }
+    rate_limits {
+        uuid user_id PK
+        timestamp window PK
+        int counter
+    }
+    upload_buffer {
+        uuid upload_id PK
+        uuid user_id FK
+        int part_number
+        bytes part_data
+        timestamp expires_at
+    }
+    search_cache {
+        string query_hash PK
+        json results
+        timestamp expires_at
+    }
+```
+
+**Расчеты:**
+
+Хранимые таблицы считаем за год, кэши и буферы - в пике. Пиковый QPS берем из раздела 2, средний = `пик / 3,60`
+
+Размер строки - сумма полей схемы по порядку: `uuid` 16 Б, `timestamp` 8 Б, `int` 4 Б, `float` 8 Б, `bool` и `enum` 1 Б; для строк, `json` и `bytes` - средняя длина значения
+
+- `users`: `30 млн MAU * 2 = 60 млн` по `16 + 32 (логин) + 60 (bcrypt) + 32 (имя) + 256 (настройки) + 1 + 8 = 405 Б`. Чтение - авторизация: 188
+- `sessions`: TTL 24 часа, коэффициент наложения 1,5: `4,5 млн DAU * 1,5 = 6,75 млн` по `32 (SHA-256) + 16 + 64 (устройство) + 16 (IPv6) + 8 + 8 = 144 Б`. Чтение на каждый запрос: `1 525 (api) + 762,5 (chat) + 152,5 (voice) + 76,25 (upload) = 2 516`, запись - авторизация: 188
+- `dialogs`: 4,62 запроса в диалоге (среднее по датасету ShareChat[^6]): `18,3 млн / 4,62 * 365 = 1,45 млрд` по `16 + 16 + 100 (название) + 1 + 8 + 8 = 149 Б`. Чтение - список диалогов и открытие диалога: `762,5 * 2 = 1 525`, запись - создание и обновление: `762,5 / 4,62 + 762,5 = 928`
+- `messages`: `18,3 млн * 2 * 365 = 13,36 млрд` по `16 + 16 + 4 + 1 + 5 001 (текст) + 1 + 4 + 16 + 8 = 5 067 Б`. Чтение - открытие истории: 763, запись - запрос, ответ и обновление ответа: `762,5 * 3 = 2 288`
+- `attachments`, `blobs`: `1,83 млн * 3 * 365 = 2,00 млрд` (файлы, голосовые запросы и ответы). Метаданные по `16 + 16 + 1 + 36 (ключ) + 16 (MIME) + 64 (имя файла) + 4 + 8 = 161 Б`, содержимое `17,08 ТБ * 365 = 6,24 ПБ`. Каждый объект пишется и читается один раз: `76,25 * 3 = 229`
+- `model_versions`: 12 версий по `16 + 32 + 36 + 1 + 8 = 93 Б`
+- `training_samples`: `549 тыс. * 12 = 6,59 млн` по `16 * 4 = 64 Б`
+- `datasets`: `3 * 12 = 36` версий по `16 + 4 + 1 + 36 + 4 + 8 = 69 Б`
+- `training_runs`: 12 запусков по `16 * 3 + 512 (параметры) + 1 + 8 + 8 = 577 Б`
+- `evaluations`: 12 версий по 50 метрик = 600 по `16 + 16 + 32 + 8 + 8 = 80 Б`
+- `dialog_context_cache`: TTL 30 мин: `762,5 * 1 800 = 1,37 млн` диалогов по `16 + 27 000 (3 375 токенов * 4 * 2) + 8 = 27 КБ`. Чтение на запрос: 763, запись запроса и ответа: 1 525
+- `kv_cache`: генерация `1 115 / 50 токенов/с = 22,3 с`, одновременно `762,5 * 22,3 = 17 тыс.` по 1,11 ГБ (3 375 токенов на конец генерации, 320 КБ на токен для 70B). Каждый токен читает кэш и дописывает в него: 850 416
+- `stream_buffer`: TTL 5 мин: `17 тыс. + 762,5 * 300 = 246 тыс.` по `16 + 8 922 (ответ) + 4 + 8 = 8,95 КБ`. Чанки по 20 токенов, каждый пишется и читается один раз: `850 416 / 20 = 42 521`
+- `search_cache`: TTL 1 час, доля попаданий 30%. Чтение на каждый вызов поиска: 458, запись при промахе: `457,5 * 0,7 = 320`. Строк `320 * 3 600 = 1,15 млн` по `32 + 5 000 (5 результатов) + 8 = 5,04 КБ`
+- `rate_limits`: 4,5 млн DAU по `16 + 8 + 4 = 28 Б`. Инкремент с чтением на каждый `chat`, `voice`, `upload`: `762,5 + 76,25 + 76,25 = 915`
+- `upload_buffer`: файл 10 МБ грузится 8 с (канал 10 Мбит/с) частями по 5 МБ: `76,25 * 8 * 2 = 1 220` частей. Запись частей и чтение при сборке: `76,25 * 2 = 153`
+
+**Описание таблиц:**
+
+| Таблица | Назначение | Строк | Объем | Чтение, QPS | Чтение пик, QPS | Запись, QPS | Запись пик, QPS |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `users` | Профили пользователей | 60 млн | 24,3 ГБ | 52 | 188 | < 1 | < 1 |
+| `sessions` | Сессии | 6,75 млн | 0,97 ГБ | 699 | 2 516 | 52 | 188 |
+| `dialogs` | Диалоги | 1,45 млрд | 215 ГБ | 424 | 1 525 | 258 | 928 |
+| `messages` | Сообщения | 13,36 млрд | 67,7 ТБ | 212 | 763 | 635 | 2 288 |
+| `attachments` | Метаданные файлов и голоса | 2,00 млрд | 323 ГБ | 64 | 229 | 64 | 229 |
+| `blobs` | Содержимое файлов, голоса, датасетов, весов | 2,00 млрд | 6,24 ПБ | 64 | 229 | 64 | 229 |
+| `model_versions` | Версии модели | 12 | 1,1 КБ | < 1 | < 1 | < 1 | < 1 |
+| `training_samples` | Примеры для обучения | 6,59 млн | 0,42 ГБ | < 1 | < 1 | < 1 | < 1 |
+| `datasets` | Версии датасета | 36 | 2,5 КБ | < 1 | < 1 | < 1 | < 1 |
+| `training_runs` | Запуски обучения | 12 | 6,9 КБ | < 1 | < 1 | < 1 | < 1 |
+| `evaluations` | Оценки моделей | 600 | 48 КБ | < 1 | < 1 | < 1 | < 1 |
+| `dialog_context_cache` | Контекст диалога | 1,37 млн | 37 ГБ | 212 | 763 | 424 | 1 525 |
+| `kv_cache` | KV-кэш модели | 17 тыс. | 18,9 ТБ | 236 227 | 850 416 | 236 227 | 850 416 |
+| `stream_buffer` | Чанки ответа | 246 тыс. | 2,2 ГБ | 11 811 | 42 521 | 11 811 | 42 521 |
+| `search_cache` | Результаты веб-поиска | 1,15 млн | 5,8 ГБ | 127 | 458 | 89 | 320 |
+| `rate_limits` | Счетчики запросов | 4,5 млн | 0,13 ГБ | 254 | 915 | 254 | 915 |
+| `upload_buffer` | Части загружаемых файлов | 1 220 | 6,1 ГБ | 42 | 153 | 42 | 153 |
+
+**Консистентность:**
+
+- Строгая: уникальность логина, отзыв сессии, публикация версии модели, порядок сообщений в диалоге (`seq`)
+- Read-your-writes для `messages`: отправленное сообщение сразу видно автору, на других устройствах допустимо отставание
+- Eventual: `dialogs`, данные обучения
+- `blobs` пишется раньше `attachments`, объекты без метаданных удаляются фоново
+- Кэши и буферы восстанавливаются из `messages` или повторным prefill, их потеря допустима
+
+**Распределение нагрузки по ключам:**
+
+- `user_id` - равномерно: пользователь в среднем делает всего 4 запроса в сутки, поэтому горячих ключей нет. Ботов и скрипты отсекает `rate_limits`
+- `dialog_id` - почти вся нагрузка на диалоги последних часов, старые данные холодные; `kv_cache` привязан к GPU-узлу через consistent hashing
+- `query_hash` - распределение Zipf, популярные запросы дают горячие ключи
+- `message_id` в `stream_buffer` - максимальная частота операций при жизни ключа в несколько минут
+- Пик в активные часы в 3,60 раза выше среднего, 80% запросов из западной части страны
+
+---
+
 ### Список источников
 
 [^1]: [Финансовый отчет Яндекса Q4 2025](https://yandex.ru/company/news/17-02-2026)
