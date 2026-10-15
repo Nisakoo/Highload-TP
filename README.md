@@ -523,119 +523,75 @@ erDiagram
 
 ### 6. Физическая схема БД
 
-**Схема:**
+**Выбор СУБД:**
 
-Пунктиром отмечены кэши и буферы
+| Таблицы | СУБД | Почему |
+|---|---|---|
+| users, dialogs, model_versions, datasets, training_samples, training_runs, evaluations | PostgreSQL | Небольшие таблицы, нужны транзакции |
+| messages | ScyllaDB | 68,1 ТБ в год, много записи, чтение по `dialog_id` |
+| blobs, upload_buffer | Ceph | Петабайты файлов, S3 API, erasure coding |
+| sessions, rate_limits, dialog_context_cache, stream_buffer, search_cache | Redis | Данные в памяти с коротким TTL |
+| kv_cache | Память GPU (SGLang) | Живет рядом с вычислением |
 
-```mermaid
-flowchart TB
-    subgraph PG_AUTH["PostgreSQL auth: без шардирования"]
-        users["<b>users</b><br/>uuid user_id PK<br/>text login UNIQUE<br/>text password_hash<br/>text name<br/>jsonb settings<br/>bool allow_training<br/>timestamp created_at"]
-    end
-    subgraph PG_DIALOGS["PostgreSQL dialogs: 16 шардов по hash(user_id)"]
-        dialogs["<b>dialogs</b><br/>uuid dialog_id PK<br/>uuid user_id SHARD KEY<br/>text title<br/>bool is_deleted<br/>timestamp created_at<br/>timestamp updated_at<br/>INDEX (user_id, updated_at DESC) WHERE NOT is_deleted"]
-    end
-    subgraph SCYLLA["ScyllaDB: шардирование по dialog_id, RF 3"]
-        messages["<b>messages</b><br/>uuid dialog_id PARTITION KEY<br/>int seq CLUSTERING DESC<br/>uuid message_id<br/>uuid user_id<br/>text role<br/>text content<br/>text status<br/>int tokens<br/>uuid model_version_id<br/>list attachments: kind, object_key, mime_type, original_name, size<br/>timestamp created_at"]
-    end
-    subgraph CEPH["Ceph S3: CRUSH по object_key, EC 8+3"]
-        blobs["<b>blobs</b><br/>бакеты files, voice, ml<br/>text object_key PK<br/>bytes data<br/>int size<br/>text etag"]
-        upload_buffer["<b>upload_buffer</b><br/>multipart upload<br/>text upload_id PK<br/>int part_number<br/>bytes part_data"]
-    end
-    subgraph PG_ML["PostgreSQL ml: без шардирования"]
-        model_versions["<b>model_versions</b><br/>uuid model_version_id PK<br/>text base_model<br/>text adapter_object_key<br/>text status<br/>timestamp published_at<br/>UNIQUE (status) WHERE status = 'published'"]
-        datasets["<b>datasets</b><br/>uuid dataset_id PK<br/>int version<br/>text stage<br/>text object_key<br/>int size<br/>timestamp created_at<br/>UNIQUE (version, stage)"]
-        training_samples["<b>training_samples</b><br/>uuid sample_id PK<br/>uuid dataset_id INDEX<br/>uuid dialog_id<br/>int request_seq<br/>int response_seq"]
-        training_runs["<b>training_runs</b><br/>uuid run_id PK<br/>uuid dataset_id INDEX<br/>uuid result_model_version_id<br/>jsonb params<br/>text status<br/>timestamp started_at<br/>timestamp finished_at"]
-        evaluations["<b>evaluations</b><br/>uuid evaluation_id PK<br/>uuid model_version_id INDEX<br/>text metric<br/>float value<br/>timestamp created_at"]
-    end
-    subgraph REDIS_DC["Redis: в каждом ДЦ"]
-        sessions["<b>sessions</b><br/>HASH session:{token_hash}<br/>user_id, device, ip, created_at<br/>SET user_sessions:{user_id}<br/>TTL 24 часа"]
-        rate_limits["<b>rate_limits</b><br/>STRING rl:{user_id}:{minute}<br/>INCR, TTL 1 мин"]
-    end
-    subgraph REDIS_GPU["Redis Cluster: в каждом GPU-ЦОД, 6 шардов по CRC16 ключа"]
-        dialog_context_cache["<b>dialog_context_cache</b><br/>LIST ctx:{dialog_id}<br/>TTL 30 мин"]
-        stream_buffer["<b>stream_buffer</b><br/>STREAM stream:{message_id}<br/>TTL 5 мин"]
-        search_cache["<b>search_cache</b><br/>STRING search:{query_hash}<br/>TTL 1 час, LRU"]
-    end
-    subgraph GPU["Память GPU: SGLang, consistent hashing по dialog_id"]
-        kv_cache["<b>kv_cache</b><br/>блоки KV по dialog_id<br/>вытеснение в RAM по LRU"]
-    end
+**Индексы:**
 
-    users --> dialogs
-    dialogs --> messages
-    messages --> blobs
-    messages --> model_versions
-    model_versions --> blobs
-    datasets --> blobs
-    datasets --> training_samples
-    training_samples --> messages
-    datasets --> training_runs
-    training_runs --> model_versions
-    model_versions --> evaluations
-    users -.-> sessions
-    users -.-> rate_limits
-    upload_buffer -.-> blobs
-    dialogs -.-> dialog_context_cache
-    dialogs -.-> kv_cache
-    messages -.-> stream_buffer
-```
+| Таблицы | Ключи и индексы |
+|---|---|
+| users | `UNIQUE (login)` |
+| dialogs | `INDEX (user_id, updated_at DESC) WHERE NOT is_deleted` |
+| model_versions | `UNIQUE (status) WHERE status = 'published'` |
+| datasets | `UNIQUE (version, stage)` |
+| training_samples, training_runs | `INDEX (dataset_id)` |
+| evaluations | `INDEX (model_version_id)` |
+| messages | Ключ партиции `dialog_id`, сортировка `seq DESC` |
+| blobs, upload_buffer | Ключ `object_key` в бакете |
+| sessions | Ключ `session:{token_hash}`, обратный индекс `user_sessions:{user_id}` |
+| rate_limits | Ключ `rl:{user_id}:{minute}` |
+| dialog_context_cache, stream_buffer, search_cache | Ключи `ctx:{dialog_id}`, `stream:{message_id}`, `search:{query_hash}` |
+| kv_cache | Ключ `dialog_id` |
 
-**Описание таблиц:**
+**Шардирование и резервирование:**
 
-| Таблица | СУБД | Ключ и индексы | Шардирование | Резервирование |
-|---|---|---|---|---|
-| `users` | PostgreSQL | PK `user_id`, UNIQUE `login` | Нет | Мастер в Москве, синхронная реплика в СПб, асинхронные реплики в региональных ДЦ |
-| `sessions` | Redis | `session:{token_hash}`, `user_sessions:{user_id}` | Нет | Мастер в Москве, реплика в каждом ДЦ |
-| `dialogs` | PostgreSQL | PK `dialog_id`, `(user_id, updated_at DESC)` | 16 логических шардов по `hash(user_id)` на 4 узлах | Мастер и синхронная реплика в разных GPU-ЦОД, асинхронные реплики в региональных ДЦ |
-| `messages` | ScyllaDB | Partition `dialog_id`, clustering `seq DESC` | Кольцо токенов по `dialog_id` | RF 3 в Москве и СПб |
-| `blobs`, `upload_buffer` | Ceph | Бакет и `object_key` | CRUSH по `object_key` | EC 8+3, multisite-репликация Москва - СПб |
-| `model_versions`, `datasets`, `training_samples`, `training_runs`, `evaluations` | PostgreSQL | PK, индексы на FK, UNIQUE на опубликованную версию | Нет | Мастер и синхронная реплика |
-| `dialog_context_cache`, `stream_buffer`, `search_cache` | Redis Cluster | `ctx:{dialog_id}`, `stream:{message_id}`, `search:{query_hash}` | 6 шардов по CRC16 ключа в каждом GPU-ЦОД | Реплика на шард |
-| `rate_limits` | Redis | `rl:{user_id}:{minute}` | Нет, свой экземпляр в каждом ДЦ | Реплика |
-| `kv_cache` | Память GPU (SGLang) | `dialog_id` | Consistent hashing по `dialog_id` (раздел 4) | Нет, при потере - повторный prefill |
+| Таблицы | Шардирование | Резервирование |
+|---|---|---|
+| users | Нет | Мастер, синхронная реплика в другом ЦОД, асинхронные в регионах |
+| dialogs | 16 логических шардов по `hash(user_id)` на 4 узлах | Как у users |
+| model_versions, datasets, training_samples, training_runs, evaluations | Нет | Мастер и синхронная реплика |
+| messages | Кольцо токенов по `dialog_id` | RF 3 в Москве и СПб |
+| blobs, upload_buffer | CRUSH по `object_key` | EC 8+3, репликация Москва - СПб |
+| sessions | Нет | Мастер в Москве, реплика в каждом ДЦ |
+| rate_limits | Нет, отдельно в каждом ДЦ | Реплика |
+| dialog_context_cache, stream_buffer, search_cache | 6 шардов по CRC16 | Реплика на шард |
+| kv_cache | Consistent hashing по `dialog_id` | Нет, пересчитывается |
 
 Объем с учетом резервирования за год:
 
-- `messages`: `68,1 ТБ * 3 (RF) / 2 (сжатие LZ4) = 102 ТБ` в каждом GPU-ЦОД, при 8 ТБ данных на узел - 13 узлов ScyllaDB
-- `blobs`: `6,24 ПБ * 11 / 8 (EC 8+3) = 8,58 ПБ` дисков в каждом GPU-ЦОД
-- `dialogs`: `215 ГБ / 4 = 54 ГБ` на узел PostgreSQL
-- Redis Cluster: `48 + 2,2 + 5,8 = 56 ГБ`, по 9,3 ГБ и `(763 + 1 525 + 42 521 * 2 + 458 + 320) / 6 = 14,7 тыс.` операций/с на шард в пике
-
-**Выбор СУБД:**
-
-PostgreSQL взяли для небольших таблиц, где нужны транзакции и строгая консистентность: уникальный логин, одна опубликованная версия модели, список диалогов по `updated_at`
-
-`messages` растет на 68,1 ТБ в год, пишется чаще, чем читается, и читается только по `dialog_id`, поэтому для нее ScyllaDB. Она масштабируется добавлением узлов, а `LOCAL_QUORUM` на запись и чтение дает read-your-writes
-
-Файлы лежат в Ceph: петабайты данных с S3 API, а erasure coding экономит диски по сравнению с тройной репликацией. Redis нужен для данных с коротким TTL: в Streams лежат чанки ответа, на `INCR` сделаны лимиты. KV-кэш остается в памяти GPU, им управляет SGLang
-
-**Клиентские библиотеки:**
-
-| СУБД | Go (бэкенды, Inference Gateway) | Python (обучение) |
-|---|---|---|
-| PostgreSQL | pgx | psycopg |
-| ScyllaDB | scylladb/gocql | scylla-driver |
-| Redis | go-redis | - |
-| Ceph | aws-sdk-go-v2 (S3) | boto3 |
+| Таблицы | Расчет |
+|---|---|
+| messages | `68,1 ТБ * 3 (RF) / 2 (сжатие) = 102 ТБ`, 13 узлов по 8 ТБ |
+| blobs | `6,24 ПБ * 11 / 8 (EC) = 8,58 ПБ` |
+| dialogs | `215 ГБ / 4 = 54 ГБ` на узел |
+| dialog_context_cache, stream_buffer, search_cache | `48 + 2,2 + 5,8 = 56 ГБ`, на шард 9,3 ГБ и `88,1 тыс. / 6 = 14,7 тыс.` операций/с |
 
 **Балансировка и мультиплексирование:**
 
-- PostgreSQL - перед каждым узлом стоит PgBouncer в режиме transaction, он сводит тысячи соединений бэкендов к ~100. Мастера выбирает Patroni через etcd. Пишем в мастер, читаем по репликам round robin (раздел 4)
-- dialogs - шард выбирает приложение: `hash(user_id) % 16`, а узел логического шарда берет из etcd. Когда узлов не хватает, шарды переносятся на новые узлы целиком, хэш не меняется
-- ScyllaDB - драйвер token-aware и shard-aware: запрос идет сразу на узел и ядро CPU, которые владеют ключом. DC-aware - в ближайший GPU-ЦОД
-- Redis Cluster - клиент хранит карту слотов и переходит по `MOVED`, чанки `stream_buffer` пишутся пайплайном
-- Ceph - несколько RGW за Nginx, least connections
+| СУБД | Как балансируем |
+|---|---|
+| PostgreSQL | PgBouncer (transaction) сводит тысячи соединений к ~100, мастера выбирает Patroni, чтение round robin по репликам |
+| PostgreSQL (dialogs) | Шард выбирает приложение: `hash(user_id) % 16`, узел шарда берется из etcd |
+| ScyllaDB | Драйвер шлет запрос сразу на нужный узел и ядро, в ближайший ЦОД |
+| Redis Cluster | Клиент хранит карту слотов, переходит по `MOVED` |
+| Ceph | Несколько RGW за Nginx, least connections |
 
 **Резервное копирование:**
 
-| Данные | Схема |
+| СУБД | Схема |
 |---|---|
-| PostgreSQL | WAL-G: полный бэкап раз в неделю, инкрементальный раз в сутки, непрерывный архив WAL в Ceph другого ДЦ. Восстановление на любой момент за 30 дней |
-| ScyllaDB | Scylla Manager: инкрементальный снапшот раз в сутки в Ceph другого ДЦ, хранение 30 дней |
-| Ceph | Полную копию 6,24 ПБ не делаем: от отказа дисков защищает EC 8+3, от отказа ДЦ - multisite-репликация, от ошибочного удаления - версионирование бакетов на 7 дней |
-| Redis sessions | RDB раз в час и AOF: после перезапуска пользователи не разлогиниваются |
-| Остальные кэши и буферы | Не бэкапим, пересобираем из основных данных |
+| PostgreSQL | WAL-G: полный бэкап раз в неделю, инкрементальный раз в сутки, архив WAL, хранение 30 дней |
+| ScyllaDB | Scylla Manager: снапшот раз в сутки, хранение 30 дней |
+| Ceph | Полной копии нет: EC, репликация между ЦОД, версионирование 7 дней |
+| Redis (sessions) | RDB раз в час и AOF |
+| Остальные кэши и буферы | Не бэкапим |
 
 ---
 
