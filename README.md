@@ -690,10 +690,12 @@ erDiagram
 
 | Технология | Где используется | Альтернативы | Почему выбрали |
 |---|---|---|---|
-| Prometheus | Метрики сервисов, GPU и SGLang, алерты через Alertmanager | VictoriaMetrics, Zabbix, Graphite | Отказ видно до жалоб пользователей. PromQL и экспортеры почти для всего, SGLang отдает `/metrics` |
-| OpenTelemetry | Сбор трейсов и логов со всех сервисов | Jaeger SDK, Zipkin | Показывает, где задержка на пути Nginx - бэкенд - Gateway - GPU. Открытый стандарт, SDK для Go и JS |
-| Grafana | Дашборды и алерты | Kibana, Zabbix | Prometheus и ClickHouse на одном дашборде |
-| ClickHouse | Хранение логов, трейсов и продуктовой аналитики | Elasticsearch, Grafana Loki | Колонки хорошо сжимают логи, агрегаты по миллиардам строк за секунды, читает из Kafka |
+| Prometheus | Сбор метрик сервисов, GPU и SGLang в каждом ДЦ, алерты через Alertmanager | Zabbix, Graphite | Отказ видно до жалоб пользователей. Экспортеры почти для всего, алерты работают даже без связи между ДЦ |
+| Grafana Mimir | Долгосрочное хранение метрик всех ДЦ, Prometheus пишет через `remote_write` | VictoriaMetrics, Thanos | Хранит метрики в Ceph по S3 и масштабируется горизонтально, полностью совместим с PromQL |
+| OpenTelemetry Collector | Прием трейсов и логов со всех сервисов по OTLP, сэмплирование | Fluent Bit, Vector | Одна точка приема по открытому стандарту, отправляет трейсы в Tempo, а логи в ClickHouse |
+| Grafana Tempo | Хранение трейсов | Jaeger, Zipkin | Показывает, где задержка на пути Nginx - бэкенд - Gateway - GPU. Индексирует только `trace_id` и хранит в Ceph, поэтому трейсы дешево хранить почти все |
+| Grafana | Дашборды | Kibana, Zabbix | Mimir, Tempo и ClickHouse в одном интерфейсе, переход от графика метрики к трейсу |
+| ClickHouse | Хранение логов и продуктовой аналитики | Elasticsearch, Grafana Loki | Колонки хорошо сжимают логи, агрегаты по миллиардам строк за секунды, читает из Kafka |
 
 **Тестирование**
 
