@@ -706,6 +706,169 @@ erDiagram
 
 ---
 
+### 10. Схема проекта
+
+Сплошные стрелки - синхронные вызовы, пунктир - асинхронные события и репликация. Москва и СПб одновременно региональные ДЦ и GPU-ЦОД
+
+**Схема 1. Онлайн-контур:**
+
+```mermaid
+flowchart TB
+    C[Клиент]
+
+    subgraph EXT[Внешняя балансировка]
+        CDN[CDN<br/>статика]
+        AC[Anycast<br/>auth, api]
+        DNS[GeoDNS<br/>chat, voice, upload]
+    end
+
+    subgraph IN[Вход: каждый ДЦ]
+        R[Маршрутизаторы<br/>BGP + ECMP] --> LB4[DPVS<br/>DR, Maglev] --> LB7[Nginx]
+    end
+
+    subgraph EDGE[ДЦ Новосибирск, Хабаровск]
+        EAUTH[auth]
+        EAPI[api]
+        EUP[upload]
+        ERS[(Redis<br/>реплика)]
+        EPG[(PostgreSQL<br/>async-реплики)]
+    end
+
+    subgraph CORE[ДЦ Москва, СПб]
+        CAUTH[auth]
+        CAPI[api]
+        CUP[upload]
+        GW[Inference Gateway]
+        STT[STT]
+        TTS[TTS]
+        WS[web-search]
+        subgraph GPUC[GPU-кластер]
+            SG[GPU-узлы<br/>SGLang]
+        end
+        subgraph STORE[Хранилище]
+            RS[(Redis<br/>мастер)]
+            RC[(Redis Cluster)]
+            PG[(PostgreSQL<br/>мастер<br/>sync-реплика)]
+            SC[(ScyllaDB<br/>messages)]
+            CEPH[(Ceph<br/>blobs, статика)]
+            K[[Kafka]]
+        end
+    end
+
+    YS[Яндекс Поиск]
+
+    C --> CDN & AC & DNS
+    AC & DNS --> R
+    CDN -->|origin| CEPH
+
+    LB7 -->|round robin| EAUTH & EAPI & CAUTH & CAPI
+    LB7 -->|least conn| EUP & CUP
+    LB7 -->|chat, voice: ДЦ по загрузке GPU| GW
+
+    EAUTH -->|users| PG
+    EAPI -->|dialogs| EPG
+    EAPI -->|история| SC
+    EUP -->|файлы| CEPH
+
+    CAUTH -->|users| PG
+    CAPI -->|dialogs| PG
+    CAPI -->|история| SC
+    CUP -->|файлы| CEPH
+
+    GW -->|hash dialog_id| SG
+    GW -->|least request| STT & TTS & WS
+    WS --> YS
+    GW -->|messages| SC
+    GW -->|вложения, голос| CEPH
+    SG -->|LoRA-адаптер| CEPH
+
+    PG -.->|репликация| EPG
+    GW & EUP & CUP -.->|события| K
+```
+
+**Схема 2. Асинхронный контур и обучение:**
+
+```mermaid
+flowchart LR
+    GW[Inference Gateway] -.->|message.completed| K[[Kafka]]
+    UP[upload] -.->|blob.created| K
+    API[api] -.->|dialog.deleted| K
+
+    K -.-> DU[api: обновление dialogs] --> PG[(PostgreSQL)]
+    K -.-> SMP[sampler<br/>0,1% при allow_training] --> PG
+    K -.-> GC[blob-gc] --> CEPH[(Ceph)]
+    K -.-> CH[(ClickHouse<br/>логи и аналитика)]
+
+    subgraph TR[Контур обучения, раз в месяц]
+        SP[Spark<br/>очистка, MinHash + LSH,<br/>токенизация] --> PT[PyTorch<br/>LoRA] --> EV[lm-evaluation-harness]
+    end
+
+    PG -->|training_samples| SP
+    SC[(ScyllaDB<br/>messages)] -->|тексты примеров| SP
+    SP -->|raw, clean, tokenized| CEPH
+    PT -->|checkpoints, адаптер| CEPH
+    EV -->|evaluations, публикация версии| PG
+    PG -->|новая версия модели| SG[GPU-узлы SGLang]
+    CEPH -->|адаптер| SG
+```
+
+**Сервисы:**
+
+| Сервис | Где | Тип | Данные |
+|---|---|---|---|
+| auth | Все ДЦ | Stateless, runtime, синхронный | users, sessions |
+| api | Все ДЦ | Stateless, runtime, синхронный, API Composition | dialogs, чтение messages |
+| upload | Все ДЦ | Stateless, runtime, синхронный | upload_buffer, blobs |
+| Inference Gateway | GPU-ЦОД | Stateless (состояние в Redis), runtime, API Gateway для `chat` и `voice` | Запись messages, dialog_context_cache, stream_buffer |
+| SGLang | GPU-ЦОД | Stateful (kv_cache), runtime, служебный | kv_cache |
+| STT, TTS | GPU-ЦОД | Stateless, runtime, служебный | - |
+| web-search | GPU-ЦОД | Stateless, runtime, доступ к внешнему ресурсу | search_cache |
+| sampler, blob-gc, обновление dialogs | GPU-ЦОД | Асинхронные, internal | training_samples, blobs, dialogs |
+| Spark, PyTorch, lm-evaluation-harness | Один из GPU-ЦОД | Асинхронные, по расписанию, internal | datasets, training_runs, evaluations, model_versions |
+
+Каждая таблица принадлежит одному сервису (Database per service). Исключение - messages: пишет Gateway, читает api. Иначе каждый токен ответа шел бы через лишний сетевой переход
+
+**Потоки данных:**
+
+1. Главная страница: клиент получает статику из ближайшего узла CDN, origin - Ceph
+2. Авторизация: Anycast приводит в ближайший ДЦ, Nginx отдает запрос в `auth`. Пароль проверяется по users в PostgreSQL, новая сессия пишется в мастер Redis в Москве и реплицируется во все ДЦ. Дальше каждый сервис проверяет сессию по локальной реплике
+3. Список диалогов и история: `api` читает dialogs с локальной реплики PostgreSQL (шард `hash(user_id) % 16`), а сообщения из ScyllaDB ближайшего ЦОД, и собирает ответ в памяти (API Composition)
+4. Загрузка файла: GeoDNS ведет на `upload` ближайшего ДЦ, файл идет частями по 5 МБ в upload_buffer, после последней части собирается в blobs. Клиент получает `object_key` и прикладывает его к сообщению
+5. Запрос к ИИ:
+    1. Клиент открывает SSE на `chat`, Nginx регионального ДЦ проксирует его в Inference Gateway выбранного GPU-ЦОД
+    2. Gateway проверяет сессию и rate_limits, пишет сообщение пользователя в messages
+    3. Контекст берется из dialog_context_cache, при промахе - из последних сообщений в ScyllaDB, вложения - из Ceph
+    4. Промпт уходит на GPU-узел по `dialog_id`, где уже лежит KV-кэш диалога (RadixAttention)
+    5. Если модель вызывает `web_search`, Gateway идет в web-search: сначала search_cache, при промахе - Яндекс Поиск. Результат возвращается модели (ReAct)
+    6. Токены чанками по 20 пишутся в stream_buffer и уходят клиенту по SSE через Nginx
+    7. Готовый ответ пишется в messages, контекст обновляется, в Kafka уходит `message.completed`
+6. Голос: как п. 5, но Gateway сначала отдает аудио в STT, а ответ по предложениям синтезирует TTS и отправляет клиенту аудиочанками. Аудио запроса и ответа сохраняется в blobs
+7. Асинхронные события: по `message.completed` обновляется `updated_at` в dialogs, sampler отбирает 0,1% ответов с `allow_training` в training_samples, логи и аналитика уходят в ClickHouse. По `dialog.deleted` blob-gc удаляет файлы без ссылок
+8. Обучение раз в месяц: Spark читает training_samples и тексты из ScyllaDB, чистит и токенизирует датасет в Ceph. PyTorch обучает LoRA-адаптер, lm-evaluation-harness сравнивает его с текущей версией. После публикации в model_versions GPU-узлы подгружают адаптер из Ceph
+
+**Балансировка:**
+
+| Участок | Механизм | Алгоритм |
+|---|---|---|
+| Клиент - статика (`ai`) | CDN | Ближайший узел по Anycast |
+| Клиент - ДЦ (`auth`, `api`) | Anycast | Ближайший ДЦ по BGP, при отказе анонс снимается |
+| Клиент - ДЦ (`chat`, `voice`, `upload`) | GeoDNS | ДЦ по региону клиента, неисправный исключается по health check |
+| Маршрутизатор - DPVS | BGP + ECMP | Хэш по 5-tuple |
+| DPVS - Nginx | DR | Maglev hashing |
+| Nginx - `auth`, `api` | Upstream Nginx | Round robin |
+| Nginx - `upload` | Upstream Nginx | Least connections |
+| Nginx - Inference Gateway | Upstream Nginx, веса из service discovery | GPU-ЦОД с меньшей загрузкой GPU, закрепление по cookie на 30 мин (время жизни контекста), внутри ЦОД least connections |
+| Бэкенд - бэкенд | Sidecar Envoy | Round robin |
+| Gateway - GPU-узлы | Sidecar Envoy | Взвешенный consistent hashing по `dialog_id` |
+| Gateway - STT, TTS, web-search | Sidecar Envoy | Least request |
+| Сервисы - PostgreSQL | PgBouncer, Patroni | Запись в мастер, чтение round robin по репликам, шард dialogs по `hash(user_id) % 16` |
+| Сервисы - ScyllaDB | Token-aware драйвер | Узел-владелец партиции в ближайшем ЦОД |
+| Сервисы - Redis Cluster | Карта слотов в клиенте | CRC16 ключа |
+| Сервисы - Ceph | Nginx перед RGW | Least connections |
+| Продюсеры - Kafka | Ключ партиции `dialog_id` | Consumer group делит партиции между потребителями |
+
+---
+
 ### Список источников
 
 [^1]: [Финансовый отчет Яндекса Q4 2025](https://yandex.ru/company/news/17-02-2026)
