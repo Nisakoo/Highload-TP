@@ -664,7 +664,7 @@ dialogs в ScyllaDB: 1,45 млрд строк в год, транзакции н
 
 #### Трансформер
 
-Модель решает одну задачу: по последовательности токенов предсказывает следующий токен[^15]. Ответ получается повторением этого шага: предсказанный токен дописывается в конец, и модель запускается снова
+Модель решает одну задачу: по последовательности токенов предсказывает следующий токен[^13]. Ответ получается повторением этого шага: предсказанный токен дописывается в конец, и модель запускается снова
 
 ```mermaid
 flowchart TB
@@ -758,7 +758,7 @@ Attention(Q, K, V) = softmax(Q * K^T / sqrt(d_k) + M) * V
 
 **Тензорный параллелизм**
 
-Идея Megatron[^16]: разрезать матрицы так, чтобы почти весь блок каждая GPU считала сама, а обмен был нужен только в конце. Число GPU обозначим `t`
+Идея Megatron[^14]: разрезать матрицы так, чтобы почти весь блок каждая GPU считала сама, а обмен был нужен только в конце. Число GPU обозначим `t`
 
 MLP, `y = W2 * act(W1 * x)`. Вход `x` одинаков на всех GPU, а после all-reduce полный `y` есть у каждой:
 
@@ -792,7 +792,7 @@ MLP, `y = W2 * act(W1 * x)`. Вход `x` одинаков на всех GPU, а
 
 Всего `16Ψ` на каждой GPU, причем все `N` карт хранят одно и то же. Сюда не входит память под активации: ZeRO ее не уменьшает
 
-ZeRO (Zero Redundancy Optimizer)[^17] убирает дублирование: данные делятся на `N` частей по числу GPU, каждая карта хранит и обновляет только свою часть
+ZeRO (Zero Redundancy Optimizer)[^15] убирает дублирование: данные делятся на `N` частей по числу GPU, каждая карта хранит и обновляет только свою часть
 
 | Стадия | Что делится | Память на GPU |
 |---|---|---|
@@ -808,11 +808,11 @@ ZeRO (Zero Redundancy Optimizer)[^17] убирает дублирование: �
 3. Обратный проход: слой так же собирается на время вычисления градиента
 4. Градиенты сводятся операцией reduce-scatter: каждая GPU получает усредненный градиент только для своей части параметров и обновляет ее своей частью состояния Adam
 
-Плата за экономию памяти - обмен данными: ZeRO-3 пересылает в 1,5 раза больше, чем DDP, потому что на каждом шаге передаются еще и веса. В PyTorch та же идея реализована как FSDP
+Плата за экономию памяти - обмен данными: ZeRO-3 пересылает в 1,5 раза больше, чем DDP, потому что на каждом шаге передаются еще и веса
 
 #### LoRA
 
-Полное дообучение требует `16Ψ` памяти и каждый раз создает новую копию весов. LoRA (Low-Rank Adaptation)[^18] вместо этого обучает небольшую добавку к весам
+Полное дообучение требует `16Ψ` памяти и каждый раз создает новую копию весов. LoRA (Low-Rank Adaptation)[^16] вместо этого обучает небольшую добавку к весам
 
 **Идея**
 
@@ -881,7 +881,7 @@ W' = W + (α / r) * B * A
 
 | Технология | Где используется | Альтернативы | Почему выбрали |
 |---|---|---|---|
-| SGLang | Сервинг LLM на GPU-узлах | vLLM, TGI, TensorRT-LLM | По скорости сопоставим с vLLM, результат зависит от модели и нагрузки. Берем за RadixAttention[^10]: кэш префиксов в radix-дереве и планировщик, который учитывает общий префикс, рассчитаны на многоходовые диалоги. Модель на 70 млрд параметров (140 ГБ в BF16) не помещается в одну GPU на 80 ГБ, поэтому на узле с 8 GPU включаем тензорный параллелизм `--tp 8`[^11], а между узлами - независимые копии модели, запросы между ними распределяет Gateway. Конвейерный параллелизм не нужен: модель помещается в один узел. Есть спекулятивное декодирование[^13] и вывод по JSON-схеме[^14]. У vLLM больше сообщество и шире поддержка железа, оба дают OpenAI-совместимый API, поэтому перейти можно без изменения Gateway |
+| SGLang | Сервинг LLM на GPU-узлах | vLLM, TGI, TensorRT-LLM | По скорости сопоставим с vLLM, берем за RadixAttention[^10]: кэш префикса переиспользуется между запросами одного диалога, а 70B-модель делим по 8 GPU узла тензорным параллелизмом `--tp 8`[^11] |
 | Whisper | Сервис STT для `voice` | NVIDIA NeMo (Parakeet), GigaAM, Vosk, Dessa | Открытые веса, хорошо распознает русский, голос не уходит во внешний сервис |
 | Silero TTS | Сервис TTS для `voice` | XTTS-v2, CosyVoice, Piper, Dessa | Обучен на русском, сам ставит ударения и «ё». Быстрее реального времени на CPU, GPU остаются для LLM |
 
@@ -889,9 +889,9 @@ W' = W + (α / r) * B * A
 
 | Технология | Где используется | Альтернативы | Почему выбрали |
 |---|---|---|---|
-| Apache Spark | Подготовка датасета: очистка, MinHash + LSH дедупликация, токенизация | Apache Flink, Ray Data | Задача пакетная и решается на любом движке map-shuffle-reduce, в том числе на Hadoop MapReduce. Spark берем за готовый `MinHashLSH` в MLlib, коннекторы к ScyllaDB и Ceph и запуск в Kubernetes без отдельного кластера Hadoop |
+| Apache Spark | Подготовка датасета: очистка, MinHash + LSH дедупликация, токенизация | Apache Flink, Ray Data | Задача решается и на Hadoop MapReduce, Spark берем за готовый `MinHashLSH` и запуск в Kubernetes без кластера Hadoop |
 | PyTorch | Дообучение LoRA-адаптера базовой модели | TensorFlow, JAX | Стандарт для LLM: PEFT для LoRA, веса сразу подходят SGLang |
-| DeepSpeed | Распределение обучения по 8 GPU узла, ZeRO-3 | PyTorch FSDP, PyTorch DDP | С LoRA градиенты и состояние оптимизатора адаптера занимают 16 ГБ, но веса базовой модели (140 ГБ) не помещаются в одну GPU на 80 ГБ. ZeRO-1 и ZeRO-2 веса не делят, поэтому выбираем ZeRO-3: на GPU остается 17,5 ГБ весов и 2 ГБ данных адаптера. FSDP дает то же, но DeepSpeed[^19] подключается к Hugging Face Trainer и PEFT одним конфигом |
+| DeepSpeed | Распределение обучения по 8 GPU узла, ZeRO-3 | PyTorch FSDP, PyTorch DDP | Веса базовой модели (140 ГБ) не помещаются в одну GPU на 80 ГБ, а ZeRO-3 делит их между 8 картами. FSDP дает то же, но DeepSpeed[^17] подключается к Hugging Face Trainer и PEFT одним конфигом |
 | lm-evaluation-harness | Оценка версии модели, результаты пишутся в evaluations | OpenCompass | Проверяет, что новая версия не хуже текущей: готовые бенчмарки и свои задачи на русском |
 
 **Инфраструктура**
@@ -1112,10 +1112,8 @@ flowchart LR
 [^10]: [SGLang: Efficient Execution of Structured Language Model Programs](https://arxiv.org/abs/2312.07104)
 [^11]: [SGLang: Server Arguments](https://docs.sglang.io/advanced_features/server_arguments.html)
 [^12]: [SGLang: Pipeline Parallelism for Long Context](https://docs.sglang.io/advanced_features/pipeline_parallelism.html)
-[^13]: [SGLang: Speculative Decoding](https://docs.sglang.io/advanced_features/speculative_decoding.html)
-[^14]: [SGLang: Structured Outputs](https://docs.sglang.io/advanced_features/structured_outputs.html)
-[^15]: [Attention Is All You Need](https://arxiv.org/abs/1706.03762)
-[^16]: [Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism](https://arxiv.org/abs/1909.08053)
-[^17]: [ZeRO: Memory Optimizations Toward Training Trillion Parameter Models](https://arxiv.org/abs/1910.02054)
-[^18]: [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685)
-[^19]: [DeepSpeed: Zero Redundancy Optimizer](https://www.deepspeed.ai/tutorials/zero/)
+[^13]: [Attention Is All You Need](https://arxiv.org/abs/1706.03762)
+[^14]: [Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism](https://arxiv.org/abs/1909.08053)
+[^15]: [ZeRO: Memory Optimizations Toward Training Trillion Parameter Models](https://arxiv.org/abs/1910.02054)
+[^16]: [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685)
+[^17]: [DeepSpeed: Zero Redundancy Optimizer](https://www.deepspeed.ai/tutorials/zero/)
