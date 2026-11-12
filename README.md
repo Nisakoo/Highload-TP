@@ -290,6 +290,7 @@ erDiagram
     currencies ||--o{ payments : "валюта"
     users ||--o{ payment_methods : "способы оплаты"
     payment_methods ||--o{ payments : "списание"
+    payments ||--o{ payment_events : "вебхуки"
     users ||--o{ dialogs : "создает"
     dialogs ||--o{ messages : "содержит"
     messages }o--o{ blobs : "вложения"
@@ -378,6 +379,16 @@ erDiagram
         bool is_default
         bool is_deleted
         timestamp created_at
+    }
+    payment_events {
+        string provider PK "yookassa / cloudpayments"
+        string event_id PK "id события у провайдера"
+        uuid payment_id FK
+        enum event_type "succeeded / failed / refunded"
+        json payload "тело вебхука"
+        enum status "received / processed / ignored"
+        timestamp received_at
+        timestamp processed_at
     }
     dialogs {
         uuid dialog_id PK
@@ -529,7 +540,7 @@ erDiagram
 
 | Таблицы | СУБД | Почему |
 |---|---|---|
-| users, currencies, plans, subscriptions, payments, payment_methods, base_models, model_versions, datasets, training_samples, training_runs, checkpoints, evaluations | PostgreSQL | Небольшие таблицы, нужны транзакции: оплата и продление подписки - одна транзакция |
+| users, currencies, plans, subscriptions, payments, payment_methods, payment_events, base_models, model_versions, datasets, training_samples, training_runs, checkpoints, evaluations | PostgreSQL | Небольшие таблицы, нужны транзакции: оплата и продление подписки - одна транзакция |
 | messages, dialogs | ScyllaDB | 70 ТБ и 1,45 млрд диалогов в год, много записи, чтение по ключу партиции |
 | blobs | Ceph | Петабайты файлов, S3 API, erasure coding |
 | Данные uploads | Ceph, временный бакет | Части загрузки через S3 Multipart и результаты преобразования, lifecycle-политика удаляет данные по TTL |
@@ -547,7 +558,8 @@ dialogs в ScyllaDB: 1,45 млрд строк в год, транзакции н
 |---|---|
 | users | `UNIQUE (login)` |
 | subscriptions | `INDEX (user_id, started_at DESC)` - история; `UNIQUE (user_id) WHERE status = 'active'` - одна активная подписка |
-| payments | `INDEX (user_id, created_at DESC)` - история; `UNIQUE (idempotency_key)`, `UNIQUE (provider_payment_id)` - повторный вебхук не создает второй платеж |
+| payments | `INDEX (user_id, created_at DESC)` - история; `UNIQUE (idempotency_key)` - повторный запрос не создает второе списание; `UNIQUE (provider_payment_id)` - один платеж провайдера соответствует одной строке |
+| payment_events | `PRIMARY KEY (provider, event_id)` - повторный вебхук не обрабатывается дважды; `INDEX (payment_id)` - события платежа |
 | model_versions | `UNIQUE (status) WHERE status = 'published'` |
 | datasets | `UNIQUE (version, stage)` |
 | training_samples, training_runs | `INDEX (dataset_id)` |
@@ -570,7 +582,7 @@ dialogs в ScyllaDB: 1,45 млрд строк в год, транзакции н
 | Таблицы | Шардирование | Резервирование |
 |---|---|---|
 | users | Нет | Мастер, синхронная реплика в другом ЦОД, асинхронные в регионах |
-| currencies, plans, subscriptions, payments, payment_methods | Нет | Мастер и синхронная реплика в другом ЦОД |
+| currencies, plans, subscriptions, payments, payment_methods, payment_events | Нет | Мастер и синхронная реплика в другом ЦОД |
 | base_models, model_versions, datasets, training_samples, training_runs, checkpoints, evaluations | Нет | Мастер и синхронная реплика |
 | messages | Кольцо токенов по `dialog_id` | RF 3 в Москве и СПб |
 | dialogs | Кольцо токенов по `user_id` | RF 3 в Москве и СПб |
@@ -879,6 +891,7 @@ flowchart TB
         CAUTH[auth]
         CAPI[api]
         CUP[upload]
+        BIL[billing]
         GW[Inference Gateway]
         STT[STT]
         TTS[TTS]
@@ -887,8 +900,8 @@ flowchart TB
             SG[GPU-узлы<br/>SGLang]
         end
         subgraph STORE[Хранилище]
-            RS[(Redis<br/>мастер)]
-            RC[(Redis Cluster)]
+            RS[(Redis sessions<br/>мастер в Москве,<br/>реплика в СПб)]
+            RC[(Redis Cluster<br/>контекст, web_cache,<br/>uploads, лимиты)]
             PG[(PostgreSQL<br/>мастер<br/>sync-реплика)]
             SC[(ScyllaDB<br/>messages, dialogs)]
             CEPH[(Ceph<br/>blobs, временный бакет, статика)]
@@ -897,8 +910,10 @@ flowchart TB
     end
 
     YS[Яндекс Поиск]
+    PP[Платежный провайдер<br/>ЮKassa, CloudPayments]
 
     C --> CDN & AC & DNS
+    PP -->|вебхуки на api| AC
     AC & DNS --> R
     CDN -->|origin| CEPH
 
@@ -907,23 +922,36 @@ flowchart TB
     LB7 -->|chat, voice: ДЦ по загрузке GPU| GW
 
     EAUTH -->|users: чтение| EPG
-    EAUTH -->|users: запись| PG
+    EAUTH -->|users, sessions: запись| PG & RS
+    EAUTH -->|sessions: чтение| ERS
     EAPI -->|dialogs, история| SC
     EUP -->|файлы| CEPH
+    EUP -->|метаданные uploads| RC
 
     CAUTH -->|users| PG
+    CAUTH -->|sessions| RS
     CAPI -->|dialogs, история| SC
     CUP -->|файлы| CEPH
+    CUP -->|метаданные uploads| RC
 
+    EAPI & CAPI -->|gRPC: подписки, оплата| BIL
+    BIL -->|подписки, платежи, payment_events| PG
+    BIL -->|списание| PP
+
+    GW -->|sessions| RS
+    GW -->|контекст, лимиты, uploads| RC
+    GW -->|лимит тарифа| BIL
     GW -->|hash dialog_id| SG
     GW -->|least request| STT & TTS & WS
+    WS -->|web_cache| RC
     WS --> YS
     GW -->|messages| SC
     GW -->|вложения, голос| CEPH
     SG -->|LoRA-адаптер| CEPH
 
     PG -.->|репликация| EPG
-    GW & EUP & CUP -.->|события| K
+    RS -.->|репликация| ERS
+    GW & EUP & CUP & EAPI & CAPI -.->|события| K
 ```
 
 **Схема 2. Асинхронный контур и обучение:**
@@ -934,22 +962,38 @@ flowchart LR
     UP[upload] -.->|blob.created| K
     API[api] -.->|dialog.deleted| K
 
+    OT[OTel Collector] -.->|логи| K
+
     K -.-> DU[api: обновление dialogs] --> SC[(ScyllaDB<br/>messages, dialogs)]
-    K -.-> SMP[sampler<br/>0,1% при allow_training] --> PG[(PostgreSQL)]
+    K -.-> SMP[sampler<br/>0,1% всех ответов,<br/>только allow_training] --> PG[(PostgreSQL)]
     K -.-> GC[blob-gc] --> CEPH[(Ceph)]
     K -.-> CH[(ClickHouse<br/>логи, fact_requests)]
 
     subgraph TR[Контур обучения, раз в месяц]
-        SP[Spark<br/>очистка, MinHash + LSH,<br/>токенизация] --> PT[PyTorch<br/>LoRA] --> EV[lm-evaluation-harness]
+        SP[Spark<br/>очистка, MinHash + LSH,<br/>токенизация] --> PT[PyTorch + DeepSpeed<br/>LoRA, ZeRO-3] --> EV[lm-evaluation-harness]
     end
 
     PG -->|training_samples| SP
     SC -->|тексты примеров| SP
     SP -->|raw, clean, tokenized| CEPH
-    PT -->|checkpoints, адаптер| CEPH
+    PT -->|адаптер| CEPH
     EV -->|evaluations, model_versions| PG
     PG -->|новая версия модели| SG[GPU-узлы SGLang]
     CEPH -->|адаптер| SG
+```
+
+**Схема 3. Наблюдаемость:**
+
+```mermaid
+flowchart LR
+    SVC[Все сервисы, GPU-узлы, SGLang]
+    SVC -->|метрики| PR[Prometheus<br/>в каждом ДЦ] -->|remote_write| MI[(Grafana Mimir)]
+    PR --> AM[Alertmanager]
+    SVC -.->|трейсы, логи OTLP| OT[OTel Collector]
+    OT -.->|трейсы| TE[(Grafana Tempo)]
+    OT -.->|логи| K[[Kafka]] -.-> CH[(ClickHouse)]
+    MI & TE -->|хранение| CEPH[(Ceph)]
+    MI & TE & CH --> GF[Grafana]
 ```
 
 **Сервисы:**
@@ -957,21 +1001,25 @@ flowchart LR
 | Сервис | Где | Тип | Данные |
 |---|---|---|---|
 | auth | Все ДЦ | Stateless, runtime, синхронный | users, sessions |
-| billing | Москва, СПб | Stateless, runtime, синхронный, вебхуки платежного провайдера | currencies, plans, subscriptions, payments, payment_methods |
-| api | Все ДЦ | Stateless, runtime, синхронный, API Composition | dialogs, чтение messages |
+| billing | Москва, СПб | Stateless, runtime, синхронный, вызывается из api и Gateway по gRPC | currencies, plans, subscriptions, payments, payment_methods, payment_events |
+| api | Все ДЦ | Stateless, runtime, синхронный, API Composition, фасад для billing и вебхуков провайдера, консьюмер Kafka (обновление dialogs) | dialogs, чтение messages; настройки пользователя - через auth по gRPC |
 | upload | Все ДЦ | Stateless, runtime, синхронный | uploads, blobs |
-| Inference Gateway | GPU-ЦОД | Stateless (состояние в Redis), runtime, API Gateway для `chat` и `voice` | Запись messages, dialog_context_cache, голос в blobs |
+| Inference Gateway | GPU-ЦОД | Stateless (состояние в Redis), runtime, API Gateway для `chat` и `voice` | Запись messages, dialog_context_cache, счетчики лимитов, голос в blobs |
 | SGLang | GPU-ЦОД | Stateful (kv_cache), runtime, служебный | kv_cache |
 | STT, TTS | GPU-ЦОД | Stateless, runtime, служебный | - |
 | web-search | GPU-ЦОД | Stateless, runtime, доступ к внешнему ресурсу | web_cache |
-| sampler, blob-gc, обновление dialogs | GPU-ЦОД | Асинхронные, internal | training_samples, blobs, dialogs |
-| Spark, PyTorch, lm-evaluation-harness | Один из GPU-ЦОД | Асинхронные, по расписанию, internal | datasets, training_runs, checkpoints, evaluations, model_versions |
+| sampler, blob-gc | GPU-ЦОД | Асинхронные, internal | training_samples, удаление blobs |
+| Spark, PyTorch + DeepSpeed, lm-evaluation-harness | Один из GPU-ЦОД | Асинхронные, по расписанию, internal | datasets, training_runs, checkpoints, evaluations, model_versions |
 
 Каждая таблица принадлежит одному сервису (Database per service). Исключения:
 
-- messages: пишет Gateway, читает api. Иначе каждый токен ответа шел бы через лишний сетевой переход
+- messages: пишет Gateway, читает api. Иначе каждый токен ответа шел бы через лишний сетевой переход. Spark раз в месяц читает тексты отобранных примеров
 - uploads: пишет upload, результат преобразования читает Gateway
-- Счетчики лимитов: пишет Gateway, лимит берет из тарифа, который billing кладет в сессию
+- blobs: принадлежит upload, аудио голосовых запросов и ответов пишет Gateway, файлы без ссылок удаляет blob-gc
+- sessions: пишет auth, остальные сервисы проверяют сессию по локальной реплике
+- users.allow_training: принадлежит auth, sampler читает флаг с реплики PostgreSQL
+- model_versions: пишет контур обучения, опубликованную версию читают Gateway и GPU-узлы
+- Счетчики лимитов: пишет Gateway, лимит тарифа получает от billing по gRPC и кэширует в памяти на минуту
 - fact_requests: ClickHouse сам читает `message.completed` из Kafka, отдельного сервиса нет
 
 **Потоки данных:**
@@ -982,15 +1030,20 @@ flowchart LR
 4. Загрузка файла: GeoDNS ведет на `upload` ближайшего ДЦ. Сервис создает запись в uploads диалога, части по 5 МБ идут во временный бакет Ceph (S3 Multipart), полученные отмечаются в `parts_received`. После обрыва клиент запрашивает `parts_received` и досылает недостающие части. После последней части объект собирается в blobs, фото уменьшается, из документа извлекается текст, ключ результата пишется в `converted_key`. Клиент получает `upload_id` и прикладывает его к сообщению, `message_id` записывается в uploads
 5. Запрос к ИИ:
     1. Клиент открывает SSE на `chat`, Nginx регионального ДЦ проксирует его в Inference Gateway выбранного GPU-ЦОД
-    2. Частоту запросов уже ограничил `limit_req` в Nginx. Gateway проверяет сессию и пишет сообщение пользователя в messages
+    2. Частоту запросов уже ограничил `limit_req` в Nginx. Gateway проверяет сессию, делает `INCR` счетчика `quota:{user_id}:{дата}` и сравнивает его с лимитом тарифа из billing. Если лимит не исчерпан, пишет сообщение пользователя в messages
     3. Контекст берется из dialog_context_cache, при промахе - из последних сообщений в ScyllaDB. Вложения берутся по `converted_key` из uploads диалога, после истечения TTL преобразуются заново из blobs
     4. Промпт уходит на GPU-узел по `dialog_id`, где уже лежит KV-кэш диалога
     5. Если модель вызывает `web_search`, Gateway идет в web-search. Тот запрашивает Яндекс Поиск и открывает 5 страниц: сначала web_cache, при промахе загружает страницу по HTTP. Фрагменты страниц возвращаются модели, вызов пишется в messages с `role = tool`
     6. Токены чанками по 20 уходят клиенту по SSE через Nginx. При обрыве соединения генерация не прерывается
     7. Готовый ответ пишется в messages, контекст обновляется, в Kafka уходит `message.completed`. После обрыва клиент читает ответ через `api`
 6. Голос: как п. 5, но Gateway пишет аудио запроса в blobs и отдает его в STT, а ответ по предложениям синтезирует TTS и отправляет клиенту аудиочанками. Аудио ответа после генерации сохраняется в blobs
-7. Асинхронные события: по `message.completed` обновляется `updated_at` в dialogs, sampler отбирает 0,1% ответов с `allow_training` в training_samples, строка fact_requests и логи уходят в ClickHouse. По `dialog.deleted` blob-gc удаляет файлы без ссылок
-8. Обучение раз в месяц: Spark читает training_samples и тексты из ScyllaDB, чистит и токенизирует датасет в Ceph. PyTorch обучает LoRA-адаптер и сохраняет 5 чекпоинтов, lm-evaluation-harness прогоняет на каждом бенчмарки и пишет evaluations. Чекпоинт, прошедший все пороги, публикуется в model_versions, GPU-узлы подгружают его адаптер из Ceph
+7. Асинхронные события: по `message.completed` api обновляет `updated_at` в dialogs, sampler отбирает в training_samples ответы пользователей с `allow_training` - всего 0,1% от всех ответов, строка fact_requests уходит в ClickHouse. Логи OTel Collector тоже отправляет в ClickHouse через Kafka. По `blob.created` blob-gc запоминает файл и удаляет его, если до истечения `expires_at` загрузки он не привязан к сообщению. По `dialog.deleted` blob-gc удаляет файлы без ссылок
+8. Обучение раз в месяц: Spark читает training_samples и тексты из ScyllaDB, чистит и токенизирует датасет в Ceph. PyTorch с DeepSpeed ZeRO-3 обучает LoRA-адаптер на одном узле из 8 GPU, промежуточные checkpoints лежат на локальном диске узла (под них заложен резерв 20%), в Ceph сохраняется итоговый адаптер на 2 ГБ. lm-evaluation-harness прогоняет на нем бенчмарки и пишет evaluations. Адаптер, прошедший все пороги, публикуется в model_versions, GPU-узлы подгружают его из Ceph. В Ceph хранятся 3 последние версии адаптера, более старые архивируются и удаляются
+9. Оплата подписки: клиент обращается к `api`, тот проксирует запрос в billing ближайшего ЦОД по gRPC. billing создает payment с `idempotency_key` и отправляет списание провайдеру по токену из payment_methods. Повторное нажатие или ретрай по таймауту идет с тем же `idempotency_key`, и провайдер не списывает деньги второй раз. Результат приходит вебхуком на `api.ai.domain.ru`, api передает его в billing:
+    1. billing проверяет подпись вебхука ключом провайдера. Без верной подписи - ответ 401, в БД ничего не пишется
+    2. В одной транзакции: `INSERT` в payment_events со статусом `received` и `ON CONFLICT (provider, event_id) DO NOTHING`. Если строка уже есть, это повтор: транзакция завершается, провайдеру отвечаем 200, иначе он будет присылать вебхук снова
+    3. В той же транзакции статус платежа меняется условно: `UPDATE payments ... WHERE payment_id = ... AND status = 'pending'` для `succeeded` и `failed`, `AND status = 'succeeded'` для `refunded`. Обновилась одна строка - для `succeeded` продлевается подписка, для `refunded` отменяется, событие получает статус `processed`. Ноль строк - платеж уже в конечном статусе, событие получает статус `ignored`
+    4. `COMMIT` и ответ 200. При ошибке транзакция откатывается, провайдер получает 5xx и повторяет вебхук. Одновременные дубли не проходят оба: второй `INSERT` ждет коммита первого и получает конфликт по ключу. Вторую активную подписку не даст создать `UNIQUE (user_id) WHERE status = 'active'`
 
 **Балансировка:**
 
@@ -1004,7 +1057,7 @@ flowchart LR
 | Nginx - `auth`, `api` | Upstream Nginx | Round robin |
 | Nginx - `upload` | Upstream Nginx | Least connections |
 | Nginx - Inference Gateway | Upstream Nginx, веса из service discovery | GPU-ЦОД с меньшей загрузкой GPU, закрепление по cookie на 30 мин (время жизни контекста), внутри ЦОД least connections |
-| Бэкенд - бэкенд | Sidecar Envoy | Round robin |
+| Бэкенд - бэкенд (api - auth, api - billing, Gateway - billing) | Sidecar Envoy | Round robin, billing - в ближайшем ЦОД |
 | Gateway - GPU-узлы | Sidecar Envoy | Взвешенный consistent hashing по `dialog_id` |
 | Gateway - STT, TTS, web-search | Sidecar Envoy | Least request |
 | Сервисы - PostgreSQL | PgBouncer, Patroni | Запись в мастер, чтение round robin по репликам |
