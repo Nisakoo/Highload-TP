@@ -874,6 +874,24 @@ y  = W * x + (α / r) * B * (A * x)
 
 ---
 
+### 9. Обеспечение надежности
+
+| Паттерн | Где применяется | Как работает |
+|---|---|---|
+| Резервирование N+1 и 2N | Все stateless-сервисы, DPVS, Nginx, GPU-узлы; маршрутизаторы - 2N | Отказ одного узла снижает только общую мощность, его нагрузку забирают соседние |
+| Health check | Kubernetes, Nginx, Envoy, DPVS, GeoDNS | Readiness и liveness probe и активные проверки исключают неисправный под, узел или ДЦ из балансировки, Kubernetes перезапускает под |
+| Автоматический failover | PostgreSQL (Patroni), Redis sessions (Sentinel), Redis Cluster, Kafka, ScyllaDB | Реплика становится мастером без участия человека. Кворум etcd и Sentinel - на 3 площадках (Москва, СПб, Новосибирск), поэтому при разрыве связи двух мастеров не бывает |
+| Таймауты | Все межсервисные вызовы через Envoy, обращения к БД и внешним сервисам | Зависший вызов не держит соединение и поток, ошибка возвращается быстро |
+| Retry с экспоненциальной задержкой | Идемпотентные запросы между сервисами, клиент при обрыве SSE | Повтор с растущей паузой и случайным разбросом, чтобы ретраи не создавали лавину нагрузки |
+| Идемпотентность | Платежи и возвраты (`idempotency_key`), вебхуки (`payment_events`), загрузка файлов по `parts_received` | Повтор запроса не создает второе списание или дубль данных |
+| Circuit breaker | Envoy outlier detection, web-search - Яндекс Поиск | Узел или сервис с ошибками временно исключается, запросы не копятся в очереди к нему |
+| Rate limiting | `limit_req` в Nginx, счетчики лимитов тарифа в Redis | Всплеск запросов и боты не перегружают GPU |
+| Graceful degradation | web-search, TTS, GPU-кластер | Без поиска модель отвечает сама, без TTS ответ приходит текстом, при нехватке GPU приоритет у платных тарифов, а лимиты бесплатного снижаются |
+| Гарантированная доставка событий | Kafka: RF 3, `acks = all`, consumer group | Событие не теряется при отказе брокера или потребителя, обработка продолжается с последнего закоммиченного offset |
+| Пересчитываемые данные | kv_cache, dialog_context_cache, web_cache | Кэши не резервируются: KV-кэш пересчитывается prefill, контекст собирается из ScyllaDB, страницы загружаются заново |
+
+---
+
 ### 10. Схема проекта
 
 Сплошные стрелки - синхронные вызовы, пунктир - асинхронные события и репликация. Москва и СПб одновременно региональные ДЦ и GPU-ЦОД
@@ -1010,76 +1028,6 @@ flowchart LR
     MI & TE -->|хранение| CEPH[(Ceph)]
     MI & TE & CH --> GF[Grafana]
 ```
-
-**Сервисы:**
-
-| Сервис | Где | Тип | Данные |
-|---|---|---|---|
-| auth | Все ДЦ | Stateless, runtime, синхронный | users, sessions |
-| billing | Москва, СПб | Stateless, runtime, синхронный, вызывается из api и Gateway по gRPC | currencies, plans, subscriptions, payments, payment_methods, payment_events |
-| api | Все ДЦ | Stateless, runtime, синхронный, API Composition, фасад для billing и вебхуков провайдера, консьюмер Kafka (обновление dialogs) | dialogs, чтение messages; настройки пользователя - через auth по gRPC |
-| upload | Все ДЦ | Stateless, runtime, синхронный | uploads, blobs |
-| Inference Gateway | GPU-ЦОД | Stateless (состояние в Redis), runtime, API Gateway для `chat` и `voice` | Запись messages, dialog_context_cache, счетчики лимитов, голос в blobs |
-| SGLang | GPU-ЦОД | Stateful (kv_cache), runtime, служебный | kv_cache |
-| STT, TTS | GPU-ЦОД | Stateless, runtime, служебный | - |
-| web-search | GPU-ЦОД | Stateless, runtime, доступ к внешнему ресурсу | web_cache |
-| sampler, blob-gc | GPU-ЦОД | Асинхронные, internal | training_samples, удаление blobs |
-| Spark, PyTorch + DeepSpeed, lm-evaluation-harness | Один из GPU-ЦОД | Асинхронные, по расписанию, internal | datasets, training_runs, checkpoints, evaluations, model_versions |
-
-Каждая таблица принадлежит одному сервису (Database per service). Исключения:
-
-- messages: пишет Gateway, читает api. Иначе каждый токен ответа шел бы через лишний сетевой переход. Spark раз в месяц читает тексты отобранных примеров
-- uploads: пишет upload, результат преобразования читает Gateway
-- blobs: принадлежит upload, аудио голосовых запросов и ответов пишет Gateway, файлы без ссылок удаляет blob-gc
-- sessions: пишет auth, остальные сервисы проверяют сессию по локальной реплике
-- users.allow_training: принадлежит auth, sampler читает флаг с реплики PostgreSQL
-- model_versions: пишет контур обучения, опубликованную версию читают Gateway и GPU-узлы
-- Счетчики лимитов: пишет Gateway, лимит тарифа получает от billing по gRPC и кэширует в памяти на минуту
-- fact_requests: ClickHouse сам читает `message.completed` из Kafka, отдельного сервиса нет
-
-**Потоки данных:**
-
-1. Главная страница: клиент получает статику из ближайшего узла CDN, origin - Ceph
-2. Авторизация: Anycast приводит в ближайший ДЦ, Nginx отдает запрос в `auth`. Пароль проверяется по users в PostgreSQL, новая сессия пишется в мастер Redis в Москве и реплицируется во все ДЦ. Дальше каждый сервис проверяет сессию по локальной реплике
-3. Список диалогов и история: `api` читает список из `dialogs_by_updated` и сообщения из messages в ScyllaDB ближайшего ЦОД - два запроса по ключу партиции, ответ собирается в памяти (API Composition)
-4. Загрузка файла: GeoDNS ведет на `upload` ближайшего ДЦ. Сервис создает запись в uploads диалога, части по 5 МБ идут во временный бакет Ceph (S3 Multipart), полученные отмечаются в `parts_received`. После обрыва клиент запрашивает `parts_received` и досылает недостающие части. После последней части объект собирается в blobs, фото уменьшается, из документа извлекается текст, ключ результата пишется в `converted_key`. Клиент получает `upload_id` и прикладывает его к сообщению, `message_id` записывается в uploads
-5. Запрос к ИИ:
-    1. Клиент открывает SSE на `chat`, Nginx регионального ДЦ проксирует его в Inference Gateway выбранного GPU-ЦОД
-    2. Частоту запросов уже ограничил `limit_req` в Nginx. Gateway проверяет сессию, делает `INCR` счетчика `quota:{user_id}:{дата}` и сравнивает его с лимитом тарифа из billing. Если лимит не исчерпан, пишет сообщение пользователя в messages
-    3. Контекст берется из dialog_context_cache, при промахе - из последних сообщений в ScyllaDB. Вложения берутся по `converted_key` из uploads диалога, после истечения TTL преобразуются заново из blobs
-    4. Промпт уходит на GPU-узел по `dialog_id`, где уже лежит KV-кэш диалога
-    5. Если модель вызывает `web_search`, Gateway идет в web-search. Тот запрашивает Яндекс Поиск и открывает 5 страниц: сначала web_cache, при промахе загружает страницу по HTTP. Фрагменты страниц возвращаются модели, вызов пишется в messages с `role = tool`
-    6. Токены чанками по 20 уходят клиенту по SSE через Nginx. При обрыве соединения генерация не прерывается
-    7. Готовый ответ пишется в messages, контекст обновляется, в Kafka уходит `message.completed`. После обрыва клиент читает ответ через `api`
-6. Голос: как п. 5, но Gateway пишет аудио запроса в blobs и отдает его в STT, а ответ по предложениям синтезирует TTS и отправляет клиенту аудиочанками. Аудио ответа после генерации сохраняется в blobs
-7. Асинхронные события: по `message.completed` api обновляет `updated_at` в dialogs, sampler отбирает в training_samples ответы пользователей с `allow_training` - всего 0,1% от всех ответов, строка fact_requests уходит в ClickHouse. Логи OTel Collector тоже отправляет в ClickHouse через Kafka. По `blob.created` blob-gc запоминает файл и удаляет его, если до истечения `expires_at` загрузки он не привязан к сообщению. По `dialog.deleted` blob-gc удаляет файлы без ссылок
-8. Обучение раз в месяц: Spark читает training_samples и тексты из ScyllaDB, чистит и токенизирует датасет в Ceph. PyTorch с DeepSpeed ZeRO-3 обучает LoRA-адаптер на одном узле из 8 GPU, промежуточные checkpoints лежат на локальном диске узла (под них заложен резерв 20%), в Ceph сохраняется итоговый адаптер на 2 ГБ. lm-evaluation-harness прогоняет на нем бенчмарки и пишет evaluations. Адаптер, прошедший все пороги, публикуется в model_versions, GPU-узлы подгружают его из Ceph. В Ceph хранятся 3 последние версии адаптера, более старые архивируются и удаляются
-9. Оплата подписки: клиент обращается к `api`, тот проксирует запрос в billing ближайшего ЦОД по gRPC. billing создает payment с `idempotency_key` и отправляет списание провайдеру по токену из payment_methods. Повторное нажатие или ретрай по таймауту идет с тем же `idempotency_key`, и провайдер не списывает деньги второй раз. Результат приходит вебхуком на `api.ai.domain.ru`, api передает его в billing:
-    1. billing проверяет подпись вебхука ключом провайдера. Без верной подписи - ответ 401, в БД ничего не пишется
-    2. В одной транзакции: `INSERT` в payment_events со статусом `received` и `ON CONFLICT (provider, event_id) DO NOTHING`. Если строка уже есть, это повтор: транзакция завершается, провайдеру отвечаем 200, иначе он будет присылать вебхук снова
-    3. В той же транзакции статус платежа меняется условно: `UPDATE payments ... WHERE payment_id = ... AND status = 'pending'` для `succeeded` и `failed`, `AND status = 'succeeded'` для `refunded`. Обновилась одна строка - для `succeeded` продлевается подписка, для `refunded` отменяется, событие получает статус `processed`. Ноль строк - платеж уже в конечном статусе, событие получает статус `ignored`
-    4. `COMMIT` и ответ 200. При ошибке транзакция откатывается, провайдер получает 5xx и повторяет вебхук. Одновременные дубли не проходят оба: второй `INSERT` ждет коммита первого и получает конфликт по ключу. Вторую активную подписку не даст создать `UNIQUE (user_id) WHERE status = 'active'`
-
-**Балансировка:**
-
-| Участок | Механизм | Алгоритм |
-|---|---|---|
-| Клиент - статика (`ai`) | CDN | Ближайший узел по Anycast |
-| Клиент - ДЦ (`auth`, `api`) | Anycast | Ближайший ДЦ по BGP, при отказе анонс снимается |
-| Клиент - ДЦ (`chat`, `voice`, `upload`) | GeoDNS | ДЦ по региону клиента, неисправный исключается по health check |
-| Маршрутизатор - DPVS | BGP + ECMP | Хэш по 5-tuple |
-| DPVS - Nginx | DR | Maglev hashing |
-| Nginx - `auth`, `api` | Upstream Nginx | Round robin |
-| Nginx - `upload` | Upstream Nginx | Least connections |
-| Nginx - Inference Gateway | Upstream Nginx, веса из service discovery | GPU-ЦОД с меньшей загрузкой GPU, закрепление по cookie на 30 мин (время жизни контекста), внутри ЦОД least connections |
-| Бэкенд - бэкенд (api - auth, api - billing, Gateway - billing) | Sidecar Envoy | Round robin, billing - в ближайшем ЦОД |
-| Gateway - GPU-узлы | Sidecar Envoy | Взвешенный consistent hashing по `dialog_id` |
-| Gateway - STT, TTS, web-search | Sidecar Envoy | Least request |
-| Сервисы - PostgreSQL | PgBouncer, Patroni | Запись в мастер, чтение round robin по репликам |
-| Сервисы - ScyllaDB | Token-aware драйвер | Узел-владелец партиции в ближайшем ЦОД |
-| Сервисы - Redis Cluster | Карта слотов в клиенте | CRC16 ключа |
-| Сервисы - Ceph | Nginx перед RGW | Least connections |
-| Продюсеры - Kafka | Ключ партиции `dialog_id` | Consumer group делит партиции между потребителями |
 
 ---
 
