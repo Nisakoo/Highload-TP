@@ -291,6 +291,8 @@ erDiagram
     users ||--o{ payment_methods : "способы оплаты"
     payment_methods ||--o{ payments : "списание"
     payments ||--o{ payment_events : "вебхуки"
+    payments ||--o{ refunds : "возвраты"
+    refunds |o--o{ payment_events : "вебхуки возврата"
     users ||--o{ dialogs : "создает"
     dialogs ||--o{ messages : "содержит"
     messages }o--o{ blobs : "вложения"
@@ -384,11 +386,23 @@ erDiagram
         string provider PK "yookassa / cloudpayments"
         string event_id PK "id события у провайдера"
         uuid payment_id FK
+        uuid refund_id FK "пусто, если событие не о возврате"
         enum event_type "succeeded / failed / refunded"
         json payload "тело вебхука"
         enum status "received / processed / ignored"
         timestamp received_at
         timestamp processed_at
+    }
+    refunds {
+        uuid refund_id PK
+        uuid payment_id FK
+        bigint amount "копейки, центы; не больше суммы платежа"
+        string reason
+        enum status "pending / succeeded / failed"
+        string provider_refund_id UK
+        string idempotency_key UK
+        timestamp created_at
+        timestamp refunded_at
     }
     dialogs {
         uuid dialog_id PK
@@ -540,7 +554,7 @@ erDiagram
 
 | Таблицы | СУБД | Почему |
 |---|---|---|
-| users, currencies, plans, subscriptions, payments, payment_methods, payment_events, base_models, model_versions, datasets, training_samples, training_runs, checkpoints, evaluations | PostgreSQL | Небольшие таблицы, нужны транзакции: оплата и продление подписки - одна транзакция |
+| users, currencies, plans, subscriptions, payments, payment_methods, payment_events, refunds, base_models, model_versions, datasets, training_samples, training_runs, checkpoints, evaluations | PostgreSQL | Небольшие таблицы, нужны транзакции: оплата и продление подписки - одна транзакция |
 | messages, dialogs | ScyllaDB | 70 ТБ и 1,45 млрд диалогов в год, много записи, чтение по ключу партиции |
 | blobs | Ceph | Петабайты файлов, S3 API, erasure coding |
 | Данные uploads | Ceph, временный бакет | Части загрузки через S3 Multipart и результаты преобразования, lifecycle-политика удаляет данные по TTL |
@@ -559,7 +573,8 @@ dialogs в ScyllaDB: 1,45 млрд строк в год, транзакции н
 | users | `UNIQUE (login)` |
 | subscriptions | `INDEX (user_id, started_at DESC)` - история; `UNIQUE (user_id) WHERE status = 'active'` - одна активная подписка |
 | payments | `INDEX (user_id, created_at DESC)` - история; `UNIQUE (idempotency_key)` - повторный запрос не создает второе списание; `UNIQUE (provider_payment_id)` - один платеж провайдера соответствует одной строке |
-| payment_events | `PRIMARY KEY (provider, event_id)` - повторный вебхук не обрабатывается дважды; `INDEX (payment_id)` - события платежа |
+| payment_events | `PRIMARY KEY (provider, event_id)` - повторный вебхук не обрабатывается дважды; `INDEX (payment_id)` - события платежа; `INDEX (refund_id)` - события возврата |
+| refunds | `INDEX (payment_id)` - возвраты платежа; `UNIQUE (idempotency_key)` - повторный запрос не создает второй возврат; `UNIQUE (provider_refund_id)` - один возврат провайдера соответствует одной строке |
 | model_versions | `UNIQUE (status) WHERE status = 'published'` |
 | datasets | `UNIQUE (version, stage)` |
 | training_samples, training_runs | `INDEX (dataset_id)` |
@@ -582,7 +597,7 @@ dialogs в ScyllaDB: 1,45 млрд строк в год, транзакции н
 | Таблицы | Шардирование | Резервирование |
 |---|---|---|
 | users | Нет | Мастер, синхронная реплика в другом ЦОД, асинхронные в регионах |
-| currencies, plans, subscriptions, payments, payment_methods, payment_events | Нет | Мастер и синхронная реплика в другом ЦОД |
+| currencies, plans, subscriptions, payments, payment_methods, payment_events, refunds | Нет | Мастер и синхронная реплика в другом ЦОД |
 | base_models, model_versions, datasets, training_samples, training_runs, checkpoints, evaluations | Нет | Мастер и синхронная реплика |
 | messages | Кольцо токенов по `dialog_id` | RF 3 в Москве и СПб |
 | dialogs | Кольцо токенов по `user_id` | RF 3 в Москве и СПб |
