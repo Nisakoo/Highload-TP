@@ -618,7 +618,7 @@ dialogs в ScyllaDB: 1,45 млрд строк в год, транзакции н
 
 #### Трансформер
 
-Модель по последовательности токенов предсказывает следующий токен[^13]. Ответ строится повторением: предсказанный токен дописывается в контекст, и модель запускается снова
+Модель по последовательности токенов предсказывает следующий токен[^12]. Ответ строится повторением: предсказанный токен дописывается в контекст, и модель запускается снова
 
 ```mermaid
 flowchart TB
@@ -689,7 +689,6 @@ Attention(Q, K, V) = softmax(Q * K^T / sqrt(d_k) + M) * V
 | Вид | Что делится | Обмен | Инференс | Обучение |
 |---|---|---|---|---|
 | Тензорный | Матрицы каждого слоя | 2 all-reduce на блок | Внутри узла, `t = 8` | Нет |
-| Конвейерный | Слои по стадиям | Активации между стадиями | Нет | Нет |
 | По данным | Запросы или батч | Инференс - нет, обучение - градиенты | Узел - копия модели | ZeRO-3 на 8 GPU |
 
 **Уровни вложенности**
@@ -698,33 +697,28 @@ NVLink внутри узла на порядок быстрее сети меж�
 
 ```
 Кластер: N копий модели          <- по данным, обмена нет
-└── Копия: p узлов               <- конвейерный, активации на границах
-    └── Узел: t GPU по NVLink    <- тензорный, 2L all-reduce на токен
+└── Узел: t GPU по NVLink        <- тензорный, 2L all-reduce на токен
 ```
 
-Всего GPU: `t * p * N`
+Всего GPU: `t * N`
 
-- Инференс (SGLang): `t = 8`, `p = 1`. На GPU 17,5 ГБ весов, остальное под KV-кэш. Копии модели - узлы, запросы между ними распределяет Inference Gateway по `dialog_id`
+- Инференс (SGLang): `t = 8`. На GPU 17,5 ГБ весов, остальное под KV-кэш. Копии модели - узлы, запросы между ними распределяет Inference Gateway по `dialog_id`
 - Обучение (DeepSpeed): один узел, ZeRO-3 на 8 GPU, обучается только адаптер. Если узла не хватит, ZeRO-3 растягивается на несколько
 
 **Тензорный параллелизм (инференс)**
 
-Матрицы режутся так, чтобы GPU считала свою часть блока сама, а обмен был только в конце (Megatron[^14])
+Матрицы режутся так, чтобы GPU считала свою часть блока сама, а обмен был только в конце (Megatron[^13])
 
 - MLP: `W1` делится по выходам на `t` частей, GPU `i` считает `u_i = act(W1_i * x)` без обмена, так как нелинейность поэлементная. `W2` делится по входам, GPU считает `y_i = W2_i * u_i`. All-reduce складывает `y = y_1 + ... + y_t` на всех GPU
 - Внимание: на GPU `h / t` голов и их KV-кэш, головы независимы и обмен не нужен. При `h_kv < t` голова ключей и значений копируется на несколько GPU. `W_O` делится по входам, результаты складывает второй all-reduce
 
 Итого `2L` all-reduce на токен, поэтому только внутри узла. Веса на GPU: `2Ψ / t`
 
-**Конвейерный параллелизм (не нужен)**
-
-GPU 1 считает первые блоки, GPU 2 - следующие. Передаются только активации, поэтому способ подходит для связи между узлами[^12]. Минус - простои: пока работает одна стадия, остальные ждут. Микробатчи сокращают простой, но не убирают («пузырь» конвейера). Нужен, когда модель не помещается в узел
-
 **Параллелизм по данным и ZeRO (обучение)**
 
 DDP: на каждой из `N` GPU копия модели, батч делится на `N` частей, градиенты усредняются через all-reduce, и все копии делают одинаковый шаг. При обучении с Adam в смешанной точности на параметр хранится 16 Б: вес FP16 (2 Б), градиент FP16 (2 Б), состояние Adam в FP32 (12 Б: копия веса, момент, дисперсия). Все `N` GPU хранят одно и то же
 
-ZeRO[^15] делит эти данные на `N` частей, каждая GPU хранит и обновляет свою:
+ZeRO[^14] делит эти данные на `N` частей, каждая GPU хранит и обновляет свою:
 
 | Стадия | Что делится | Память на GPU |
 |---|---|---|
@@ -739,7 +733,7 @@ ZeRO-3: GPU постоянно хранит `1 / N` весов каждого с
 
 #### LoRA
 
-Полное дообучение требует `16Ψ` памяти и дает новую копию весов. LoRA[^16] обучает только небольшую добавку к весам
+Полное дообучение требует `16Ψ` памяти и дает новую копию весов. LoRA[^15] обучает только небольшую добавку к весам
 
 Дообучение меняет матрицу на `ΔW`. Авторы показали, что у `ΔW` низкий ранг, поэтому ее можно записать произведением двух узких матриц:
 
@@ -812,7 +806,7 @@ y  = W * x + (α / r) * B * (A * x)
 |---|---|---|---|
 | Apache Spark | Подготовка датасета: очистка, MinHash + LSH дедупликация, токенизация | Apache Flink, Ray Data | Задача решается и на Hadoop MapReduce, Spark берем за готовый `MinHashLSH` и запуск в Kubernetes без кластера Hadoop |
 | PyTorch | Дообучение LoRA-адаптера базовой модели | TensorFlow, JAX | Стандарт для LLM: PEFT для LoRA, веса сразу подходят SGLang |
-| DeepSpeed | Распределение обучения по 8 GPU узла, ZeRO-3 | PyTorch FSDP, PyTorch DDP | Веса (140 ГБ) не помещаются в одну GPU на 80 ГБ, ZeRO-3 делит их между 8 картами. DeepSpeed[^17] подключается к Hugging Face Trainer одним конфигом |
+| DeepSpeed | Распределение обучения по 8 GPU узла, ZeRO-3 | PyTorch FSDP, PyTorch DDP | Веса (140 ГБ) не помещаются в одну GPU на 80 ГБ, ZeRO-3 делит их между 8 картами. DeepSpeed[^16] подключается к Hugging Face Trainer одним конфигом |
 | lm-evaluation-harness | Оценка версии модели, результаты пишутся в evaluations | OpenCompass | Проверяет, что новая версия не хуже текущей: готовые бенчмарки и свои задачи на русском |
 
 **Инфраструктура**
@@ -1034,9 +1028,8 @@ flowchart LR
 [^9]: [Testing the Performance of NGINX Ingress Controllers in a Kubernetes Environment](https://blog.nginx.org/blog/testing-performance-nginx-ingress-controller-kubernetes)
 [^10]: [SGLang: Efficient Execution of Structured Language Model Programs](https://arxiv.org/abs/2312.07104)
 [^11]: [SGLang: Server Arguments](https://docs.sglang.io/advanced_features/server_arguments.html)
-[^12]: [SGLang: Pipeline Parallelism for Long Context](https://docs.sglang.io/advanced_features/pipeline_parallelism.html)
-[^13]: [Attention Is All You Need](https://arxiv.org/abs/1706.03762)
-[^14]: [Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism](https://arxiv.org/abs/1909.08053)
-[^15]: [ZeRO: Memory Optimizations Toward Training Trillion Parameter Models](https://arxiv.org/abs/1910.02054)
-[^16]: [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685)
-[^17]: [DeepSpeed: Zero Redundancy Optimizer](https://www.deepspeed.ai/tutorials/zero/)
+[^12]: [Attention Is All You Need](https://arxiv.org/abs/1706.03762)
+[^13]: [Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism](https://arxiv.org/abs/1909.08053)
+[^14]: [ZeRO: Memory Optimizations Toward Training Trillion Parameter Models](https://arxiv.org/abs/1910.02054)
+[^15]: [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685)
+[^16]: [DeepSpeed: Zero Redundancy Optimizer](https://www.deepspeed.ai/tutorials/zero/)
