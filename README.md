@@ -898,130 +898,251 @@ y  = W * x + (α / r) * B * (A * x)
 ### 10. Схема проекта
 
 ```mermaid
+%%{init: {"flowchart": {"curve": "basis", "nodeSpacing": 35, "rankSpacing": 70}}}%%
 flowchart TB
-    C[Клиент]
+    C["Клиент"]
+    CDN["CDN<br/>статика"]
+    PP["Платежный провайдер"]
+    YS["Яндекс Поиск"]
 
-    subgraph EXT[Внешняя балансировка]
-        CDN[CDN<br/>статика]
-        AC[Anycast<br/>auth, api]
-        DNS[GeoDNS<br/>chat, voice, upload]
+    subgraph ENTRY["Вход"]
+        R["Внешняя балансировка (Anycast, GeoDNS)"]
+        LB4["DPVS<br/>L4, DR, Maglev"]
+        NG["Nginx<br/>L7, TLS, маршрутизация по домену"]
     end
 
-    subgraph IN[Вход: каждый ДЦ]
-        R[Маршрутизаторы<br/>BGP + ECMP] --> LB4[DPVS<br/>DR, Maglev] --> LB7[Nginx]
-    end
+    ISTIOD["istiod<br/>control plane Istio"]
 
-    subgraph EDGE[ДЦ Новосибирск, Хабаровск]
-        EAUTH[auth]
-        EAPI[api]
-        EUP[upload]
-        ERS[(Redis<br/>реплика)]
-        EPG[(PostgreSQL<br/>async-реплики users)]
-    end
-
-    subgraph CORE[ДЦ Москва, СПб]
-        CAUTH[auth]
-        CAPI[api]
-        CUP[upload]
-        BIL[billing]
-        GW[Inference Gateway]
-        STT[STT]
-        TTS[TTS]
-        WS[web-search]
-        subgraph GPUC[GPU-кластер]
-            SG[GPU-узлы<br/>SGLang]
+    subgraph ONLINE["Контур инференса"]
+        subgraph AUTH["auth-service"]
+            AUTHC["Envoy sidecar"]
+            AUTHS["auth"]
+            AUTHPG[("PostgreSQL<br/>users")]
+            AUTHRS[("Redis<br/>sessions")]
         end
-        subgraph STORE[Хранилище]
-            RS[(Redis sessions<br/>мастер в Москве,<br/>реплика в СПб)]
-            RC[(Redis Cluster<br/>контекст, web_cache,<br/>uploads, лимиты)]
-            PG[(PostgreSQL<br/>мастер<br/>sync-реплика)]
-            SC[(ScyllaDB<br/>messages, dialogs)]
-            CEPH[(Ceph<br/>blobs, временный бакет, статика)]
-            K[[Kafka]]
+
+        subgraph DLG["dialog-service"]
+            DLGC["Envoy sidecar<br/>проверка JWT"]
+            DLGS["dialog"]
+            DLGR["outbox relay"]
+            SC[("ScyllaDB<br/>dialogs, messages, outbox")]
         end
+
+        subgraph CHAT["chat-orchestrator"]
+            GWC["Envoy sidecar<br/>проверка JWT"]
+            GW["Inference Gateway<br/>оркестратор саги генерации"]
+            PB["prompt-builder"]
+            GWDB[("ScyllaDB<br/>saga_log, outbox")]
+        end
+
+        subgraph QUOTA["quota-service"]
+            QS["quota"]
+            QR[("Redis<br/>счетчики и лимиты тарифа")]
+        end
+
+        subgraph BILL["billing-service"]
+            BSC["Envoy sidecar<br/>проверка JWT"]
+            BS["billing<br/>оркестратор саги оплаты"]
+            BPG[("PostgreSQL<br/>plans, subscriptions, payments,<br/>payment_methods, payment_events, refunds")]
+        end
+
+        subgraph UPL["upload-service"]
+            USC["Envoy sidecar<br/>проверка JWT"]
+            US["upload"]
+            CONV["file-converter"]
+            UR[("Redis<br/>метаданные uploads")]
+        end
+
+        subgraph CTX["context-service"]
+            CTXS["context"]
+            CTXR[("Redis<br/>dialog_context_cache")]
+        end
+
+        subgraph LLMG["llm-service"]
+            SG["GPU-узлы SGLang<br/>KV-кэш в памяти GPU"]
+        end
+
+        STT["stt-service<br/>Whisper"]
+        TTS["tts-service<br/>Silero"]
+
+        subgraph WSG["web-search-service"]
+            WS["web-search"]
+            WR[("Redis<br/>web_cache")]
+        end
+
+        subgraph REG["model-registry"]
+            MR["model-registry"]
+            MRPG[("PostgreSQL<br/>base_models, model_versions")]
+        end
+
+        GC["blob-gc"]
     end
 
-    YS[Яндекс Поиск]
-    PP[Платежный провайдер<br/>ЮKassa, CloudPayments]
-
-    C --> CDN & AC & DNS
-    PP -->|вебхуки на api| AC
-    AC & DNS --> R
-    CDN -->|origin| CEPH
-
-    LB7 -->|round robin| EAUTH & EAPI & CAUTH & CAPI
-    LB7 -->|least conn| EUP & CUP
-    LB7 -->|chat, voice: ДЦ по загрузке GPU| GW
-
-    EAUTH -->|users: чтение| EPG
-    EAUTH -->|users, sessions: запись| PG & RS
-    EAUTH -->|sessions: чтение| ERS
-    EAPI -->|dialogs, история| SC
-    EUP -->|файлы| CEPH
-    EUP -->|метаданные uploads| RC
-
-    CAUTH -->|users| PG
-    CAUTH -->|sessions| RS
-    CAPI -->|dialogs, история| SC
-    CUP -->|файлы| CEPH
-    CUP -->|метаданные uploads| RC
-
-    EAPI & CAPI -->|gRPC: подписки, оплата| BIL
-    BIL -->|подписки, платежи, payment_events| PG
-    BIL -->|списание| PP
-
-    GW -->|sessions| RS
-    GW -->|контекст, лимиты, uploads| RC
-    GW -->|лимит тарифа| BIL
-    GW -->|hash dialog_id| SG
-    GW -->|least request| STT & TTS & WS
-    WS -->|web_cache| RC
-    WS --> YS
-    GW -->|messages| SC
-    GW -->|вложения, голос| CEPH
-    SG -->|LoRA-адаптер| CEPH
-
-    PG -.->|репликация| EPG
-    RS -.->|репликация| ERS
-    GW & EUP & CUP & EAPI & CAPI -.->|события| K
-```
-
-```mermaid
-flowchart LR
-    GW[Inference Gateway] -.->|message.completed| K[[Kafka]]
-    UP[upload] -.->|blob.created| K
-    API[api] -.->|dialog.deleted| K
-
-    OT[OTel Collector] -.->|логи| K
-
-    K -.-> DU[api: обновление dialogs] --> SC[(ScyllaDB<br/>messages, dialogs)]
-    K -.-> SMP[sampler<br/>0,1% всех ответов,<br/>только allow_training] --> PG[(PostgreSQL)]
-    K -.-> GC[blob-gc] --> CEPH[(Ceph)]
-    K -.-> CH[(ClickHouse<br/>логи, fact_requests)]
-
-    subgraph TR[Контур обучения, раз в месяц]
-        SP[Spark<br/>очистка, MinHash + LSH,<br/>токенизация] --> PT[PyTorch + DeepSpeed<br/>LoRA, ZeRO-3] --> EV[lm-evaluation-harness]
+    subgraph TRAIN["Контур обучения, раз в месяц"]
+        SMP["sampler<br/>0,1% ответов, allow_training"]
+        TO["training-orchestrator<br/>оркестратор саги обучения"]
+        TPG[("PostgreSQL<br/>training_samples, datasets,<br/>training_runs, checkpoints, evaluations")]
+        SP["dataset-builder<br/>Spark: очистка, MinHash + LSH"]
+        PT["trainer<br/>PyTorch + DeepSpeed, LoRA"]
+        EV["evaluator<br/>lm-evaluation-harness"]
     end
 
-    PG -->|training_samples| SP
-    SC -->|тексты примеров| SP
-    SP -->|raw, clean, tokenized| CEPH
-    PT -->|адаптер| CEPH
-    EV -->|evaluations, model_versions| PG
-    PG -->|новая версия модели| SG[GPU-узлы SGLang]
-    CEPH -->|адаптер| SG
-```
+    CEPH[("Ceph<br/>blobs, временный бакет, статика,<br/>датасеты, checkpoints, адаптеры")]
 
-```mermaid
-flowchart LR
-    SVC[Все сервисы, GPU-узлы, SGLang]
-    SVC -->|метрики| PR[Prometheus<br/>в каждом ДЦ] -->|remote_write| MI[(Grafana Mimir)]
-    PR --> AM[Alertmanager]
-    SVC -.->|трейсы, логи OTLP| OT[OTel Collector]
-    OT -.->|трейсы| TE[(Grafana Tempo)]
-    OT -.->|логи| K[[Kafka]] -.-> CH[(ClickHouse)]
-    MI & TE -->|хранение| CEPH[(Ceph)]
-    MI & TE & CH --> GF[Grafana]
+    KSAGA[["Kafka: саги чата<br/>quota.reserve, quota.release, quota.commit,<br/>message.save, upload.attach"]]
+    KBIL[["Kafka: биллинг<br/>payment.succeeded, subscription.activated,<br/>quota.limits"]]
+    KEV[["Kafka: доменные события<br/>user.created, message.completed, dialog.deleted,<br/>upload.assembled, blob.created, model.published,<br/>request.finished"]]
+    KTR[["Kafka: обучение<br/>dataset.build, train, eval, model.publish"]]
+    KLOG[["Kafka: логи"]]
+
+    subgraph DWHG["DWH"]
+        DWH[("ClickHouse DWH<br/>fact_requests,<br/>справочники users, plans, model_versions")]
+        BI["Аналитики<br/>SQL, отчеты"]
+    end
+
+    subgraph MON["Мониторинг"]
+        PR["Prometheus"]
+        PGW["Pushgateway"]
+        AM["Alertmanager"]
+        ONC["Дежурные"]
+        MI[("Grafana Mimir<br/>метрики")]
+        OT["OTel Collector<br/>сэмплирование"]
+        TE[("Grafana Tempo<br/>трейсы")]
+        CHL[("ClickHouse<br/>логи")]
+        GF["Grafana"]
+    end
+
+    %% Вход
+    C -->|"read: статика"| CDN
+    CDN -->|"read: origin"| CEPH
+    C --> R
+    PP -->|"push: вебхуки"| R
+    R -->|"BGP + ECMP"| LB4 --> NG
+    NG -->|"auth: регистрация, вход (получение refresh и access токенов)"| AUTHC
+    AUTHC --> AUTHS
+    NG -->|"dialog: round robin"| DLGC
+    NG -->|"billing: round robin"| BSC
+    NG -->|"вебхуки: проверка подписи провайдера"| BSC
+    NG -->|"upload: least conn"| USC
+    NG -->|"chat, voice: least conn<br/>SSE: push токенов клиенту"| GWC
+    DLGC --> DLGS
+    BSC --> BS
+    USC --> US
+    GWC --> GW
+    ISTIOD -.->|"pull: JWKS, публичные ключи подписи"| AUTHC
+    ISTIOD -.->|"push: JWKS, xDS"| DLGC & BSC & USC & GWC
+
+    %% auth
+    AUTHS -->|"read/write: users"| AUTHPG
+    AUTHS -->|"read/write: refresh-сессии"| AUTHRS
+    BS -->|"read: проверка сессии при оплате и смене тарифа"| AUTHC
+    AUTHS -.->|"write: user.created, user.updated"| KEV
+
+    %% dialog
+    DLGS -->|"read/write: dialogs, messages"| SC
+    DLGR -->|"read: outbox"| SC
+    DLGR -.->|"write: message.completed, dialog.deleted"| KEV
+
+    %% Сага генерации ответа
+    GW -->|"read/write: состояние саги"| GWDB
+    GW -.->|"write: команды саги с user_id"| KSAGA
+    KSAGA -.->|"read: ответы участников"| GW
+    KSAGA -.->|"read: quota.reserve, quota.commit, quota.release"| QS
+    QS -.->|"write: ответ саге"| KSAGA
+    KSAGA -.->|"read: message.save"| DLGS
+    DLGR -.->|"write: ответ саге"| KSAGA
+    KSAGA -.->|"read: upload.attach"| US
+    US -.->|"write: ответ саге"| KSAGA
+
+    %% Синхронные вызовы генерации
+    GW --> PB
+    PB -->|"read/write: контекст"| CTXS
+    PB -->|"read: вложения"| CEPH
+    GW -->|"gRPC stream: hash dialog_id"| SG
+    GW -->|"least request"| STT
+    GW -->|"least request"| TTS
+    GW -->|"least request"| WS
+    GW -.->|"write: request.finished"| KEV
+
+    QS -->|"read/write: квоты"| QR
+
+    CTXS -->|"read/write: ctx"| CTXR
+    CTXS -->|"read: история при промахе"| DLGS
+    KEV -.->|"read: dialog.deleted"| CTXS
+
+    SG -->|"read: веса, LoRA-адаптер"| CEPH
+    KEV -.->|"read: model.published, canary"| SG
+    TTS -->|"write: голосовой ответ"| CEPH
+
+    WS -->|"read/write: web_cache"| WR
+    WS -->|"read: circuit breaker"| YS
+
+    %% upload
+    US -->|"reserve, commit, release файла"| QS
+    US -->|"read/write: uploads"| UR
+    US -->|"write: части, S3 Multipart"| CEPH
+    US -.->|"write: upload.assembled, blob.created"| KEV
+    KEV -.->|"read: upload.assembled"| CONV
+    CONV -->|"read/write: файлы"| CEPH
+    CONV -->|"write: status"| UR
+    KEV -.->|"read: dialog.deleted"| US
+
+    %% Сага оплаты
+    BS -->|"read/write: подписки, платежи"| BPG
+    BS -->|"списание, возврат"| PP
+    BS -.->|"write: команды саги, subscription.activated"| KBIL
+    KBIL -.->|"read: ответы"| BS
+    KBIL -.->|"read: quota.limits"| QS
+    QS -.->|"write: ответ саге"| KBIL
+    KEV -.->|"read: user.created"| BS
+
+    %% blob-gc
+    KEV -.->|"read: dialog.deleted, blob.created"| GC
+    GC -->|"write: удаление blobs"| CEPH
+
+    %% model-registry
+    MR -->|"read/write: версии"| MRPG
+    MR -.->|"write: model.published"| KEV
+
+    %% Сага обучения
+    KEV -.->|"read: message.completed, dialog.deleted"| SMP
+    SMP -->|"write: training_samples"| TPG
+    SMP -->|"write: тексты, raw"| CEPH
+    TO -->|"read/write: runs, datasets"| TPG
+    TO -.->|"write: команды саги"| KTR
+    KTR -.->|"read: ответы"| TO
+    KTR -.->|"read: dataset.build"| SP
+    KTR -.->|"read: train"| PT
+    KTR -.->|"read: eval"| EV
+    KTR -.->|"read: model.publish"| MR
+    SP & PT & EV & MR -.->|"write: ответ саге"| KTR
+    SP -->|"read/write: датасеты"| CEPH
+    PT -->|"read/write: checkpoints"| CEPH
+    EV -->|"read: checkpoint"| CEPH
+
+    %% DWH
+    KEV -.->|"read, pull: Kafka engine<br/>request.finished, user.created, model.published"| DWH
+    KBIL -.->|"read, pull: subscription.activated"| DWH
+    BI -->|"read: SQL"| DWH
+
+    %% Мониторинг
+    PR -->|"pull: scrape /metrics"| ONLINE
+    PR -->|"pull: scrape /metrics"| PGW
+    SP & PT & EV & GC -->|"push: метрики batch-задач"| PGW
+    PR -->|"push: remote_write"| MI
+    PR -->|"push: алерты"| AM
+    AM -->|"push: уведомления"| ONC
+    ONLINE -->|"push: OTLP трейсы, логи"| OT
+    TRAIN -->|"push: OTLP трейсы, логи"| OT
+    OT -->|"push: трейсы"| TE
+    OT -.->|"write: логи"| KLOG
+    KLOG -.->|"read, pull: Kafka engine"| CHL
+    MI -->|"write: блоки"| CEPH
+    TE -->|"write: блоки"| CEPH
+    GF -->|"read: PromQL"| MI
+    GF -->|"read: TraceQL"| TE
+    GF -->|"read: SQL"| CHL
+    GF -->|"read: SQL"| DWH
 ```
 
 ---
