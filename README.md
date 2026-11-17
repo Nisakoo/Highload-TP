@@ -980,10 +980,10 @@ flowchart TB
 
         subgraph REG["model-registry"]
             MR["model-registry"]
-            MRPG[("PostgreSQL<br/>base_models, model_versions")]
+            MRPG[("PostgreSQL<br/>base_models, model_versions, доли выкатки")]
         end
 
-        GC["blob-gc"]
+        GC["blob<br/>garbage collector"]
     end
 
     subgraph TRAIN["Контур обучения, раз в месяц"]
@@ -1067,6 +1067,7 @@ flowchart TB
     PB -->|"read/write: контекст"| CTXS
     PB -->|"read: вложения"| CEPH
     GW -->|"gRPC stream: hash dialog_id"| SG
+    GW -->|"pull: конфиг моделей и доли выкатки"| MR
     GW -->|"least request"| STT
     GW -->|"gRPC stream: текст в аудио"| TTS
     GW -->|"least request"| WS
@@ -1079,7 +1080,6 @@ flowchart TB
     KEV -.->|"read: dialog.deleted"| CTXS
 
     SG -->|"read: веса, LoRA-адаптер"| CEPH
-    KEV -.->|"read: model.published, canary"| SG
     TTS -->|"write: готовое аудио для повтора"| CEPH
 
     WS -->|"read/write: web_cache"| WR
