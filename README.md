@@ -943,7 +943,8 @@ flowchart TB
         subgraph BILL["billing-service"]
             BSC["Envoy sidecar<br/>проверка JWT"]
             BS["billing<br/>оркестратор саги оплаты"]
-            BPG[("PostgreSQL<br/>plans, subscriptions, payments,<br/>payment_methods, payment_events, refunds")]
+            BSR["outbox relay"]
+            BPG[("PostgreSQL<br/>plans, subscriptions, payments,<br/>payment_methods, payment_events, refunds, outbox")]
         end
 
         subgraph UPL["upload-service"]
@@ -958,12 +959,19 @@ flowchart TB
             CTXR[("Redis<br/>dialog_context_cache")]
         end
 
-        subgraph LLMG["llm-service"]
-            SG["GPU-узлы SGLang<br/>KV-кэш в памяти GPU"]
+        subgraph GPUC["GPU-кластер"]
+            subgraph LLMG["llm-service"]
+                SG["SGLang"]
+            end
+
+            subgraph STTG["stt-service"]
+                STT["Whisper"]
+            end
         end
 
-        STT["stt-service<br/>Whisper"]
-        TTS["tts-service<br/>Silero"]
+        subgraph TTSG["tts-service"]
+            TTS["Silero"]
+        end
 
         subgraph WSG["web-search-service"]
             WS["web-search"]
@@ -1060,7 +1068,7 @@ flowchart TB
     PB -->|"read: вложения"| CEPH
     GW -->|"gRPC stream: hash dialog_id"| SG
     GW -->|"least request"| STT
-    GW -->|"least request"| TTS
+    GW -->|"gRPC stream: текст в аудио"| TTS
     GW -->|"least request"| WS
     GW -.->|"write: request.finished"| KEV
 
@@ -1072,7 +1080,7 @@ flowchart TB
 
     SG -->|"read: веса, LoRA-адаптер"| CEPH
     KEV -.->|"read: model.published, canary"| SG
-    TTS -->|"write: голосовой ответ"| CEPH
+    TTS -->|"write: готовое аудио для повтора"| CEPH
 
     WS -->|"read/write: web_cache"| WR
     WS -->|"read: circuit breaker"| YS
@@ -1090,7 +1098,8 @@ flowchart TB
     %% Сага оплаты
     BS -->|"read/write: подписки, платежи"| BPG
     BS -->|"списание, возврат"| PP
-    BS -.->|"write: команды саги, subscription.activated"| KBIL
+    BSR -->|"read: outbox"| BPG
+    BSR -.->|"write: команды саги, subscription.activated"| KBIL
     KBIL -.->|"read: ответы"| BS
     KBIL -.->|"read: quota.limits"| QS
     QS -.->|"write: ответ саге"| KBIL
