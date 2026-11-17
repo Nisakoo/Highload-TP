@@ -1005,14 +1005,12 @@ flowchart TB
 
     subgraph DWHG["DWH"]
         DWH[("ClickHouse DWH<br/>fact_requests,<br/>справочники users, plans, model_versions")]
-        BI["Аналитики<br/>SQL, отчеты"]
     end
 
     subgraph MON["Мониторинг"]
         PR["Prometheus"]
         PGW["Pushgateway"]
         AM["Alertmanager"]
-        ONC["Дежурные"]
         MI[("Grafana Mimir<br/>метрики")]
         OT["OTel Collector<br/>сэмплирование"]
         TE[("Grafana Tempo<br/>трейсы")]
@@ -1132,7 +1130,6 @@ flowchart TB
     %% DWH
     KEV -.->|"read, pull: Kafka engine<br/>request.finished, user.created, model.published"| DWH
     KBIL -.->|"read, pull: subscription.activated"| DWH
-    BI -->|"read: SQL"| DWH
 
     %% Мониторинг
     PR -->|"pull: scrape /metrics"| ONLINE
@@ -1140,7 +1137,6 @@ flowchart TB
     SP & PT & EV & GC -->|"push: метрики batch-задач"| PGW
     PR -->|"push: remote_write"| MI
     PR -->|"push: алерты"| AM
-    AM -->|"push: уведомления"| ONC
     ONLINE -->|"push: OTLP трейсы, логи"| OT
     TRAIN -->|"push: OTLP трейсы, логи"| OT
     OT -->|"push: трейсы"| TE
