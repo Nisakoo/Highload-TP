@@ -17,8 +17,15 @@ flowchart TB
         subgraph AUTH["auth-service"]
             AUTHC["Envoy sidecar"]
             AUTHS["auth"]
-            AUTHPG[("PostgreSQL<br/>users")]
+            AUTHPG[("PostgreSQL<br/>credentials")]
             AUTHRS[("Redis<br/>sessions")]
+        end
+
+        subgraph USRG["user-service"]
+            USRC["Envoy sidecar<br/>проверка JWT"]
+            USRS["user"]
+            USRR["outbox relay"]
+            USRPG[("PostgreSQL<br/>users, profiles, settings, outbox")]
         end
 
         subgraph DLG["dialog-service"]
@@ -51,7 +58,8 @@ flowchart TB
             USC["Envoy sidecar<br/>проверка JWT"]
             US["upload"]
             CONV["file-converter"]
-            UR[("Redis<br/>метаданные uploads")]
+            UPR["outbox relay"]
+            UR[("Redis<br/>метаданные uploads, outbox")]
         end
 
         subgraph CTX["context-service"]
@@ -84,6 +92,7 @@ flowchart TB
         end
 
         GC["blob<br/>garbage collector"]
+        FA["frontend-analytics"]
     end
 
     subgraph TRAIN["Контур обучения"]
@@ -103,6 +112,7 @@ flowchart TB
     KEV[["Kafka: доменные события<br/>user.created, message.completed, dialog.deleted,<br/>upload.assembled, blob.created, model.published,<br/>request.finished"]]
     KTR[["Kafka: обучение<br/>dataset.build, train, eval, model.publish"]]
     KLOG[["Kafka: логи"]]
+    KFE[["Kafka: события фронтенда"]]
 
     subgraph DWHG["DWH"]
         DWH[("ClickHouse DWH<br/>fact_requests,<br/>справочники users, plans, model_versions")]
@@ -127,23 +137,31 @@ flowchart TB
     R -->|"BGP + ECMP"| LB4 --> NG
     NG -->|"auth: регистрация, вход (получение refresh и access токенов)"| AUTHC
     AUTHC --> AUTHS
+    NG -->|"user: round robin"| USRC
     NG -->|"dialog: round robin"| DLGC
     NG -->|"billing: round robin"| BSC
     NG -->|"вебхуки: проверка подписи провайдера"| BSC
     NG -->|"upload: least conn"| USC
     NG -->|"chat, voice: least conn<br/>SSE: push токенов клиенту"| GWC
+    NG -->|"статистика: round robin"| FA
+    USRC --> USRS
     DLGC --> DLGS
     BSC --> BS
     USC --> US
     GWC --> GW
     ISTIOD -.->|"pull: JWKS, публичные ключи подписи"| AUTHC
-    ISTIOD -.->|"push: JWKS, xDS"| DLGC & BSC & USC & GWC
+    ISTIOD -.->|"push: JWKS, xDS"| USRC & DLGC & BSC & USC & GWC
 
     %% auth
-    AUTHS -->|"read/write: users"| AUTHPG
+    AUTHS -->|"read/write: credentials"| AUTHPG
     AUTHS -->|"read/write: refresh-сессии"| AUTHRS
     BS -->|"read: проверка сессии при оплате и смене тарифа"| AUTHC
-    AUTHS -.->|"write: user.created, user.updated"| KEV
+    AUTHS -->|"write: создание пользователя, идемпотентно по логину"| USRC
+
+    %% user
+    USRS -->|"read/write: users, profiles"| USRPG
+    USRR -->|"read: outbox"| USRPG
+    USRR -.->|"write: user.created, user.updated"| KEV
 
     %% dialog
     DLGS -->|"read/write: dialogs, messages"| SC
@@ -159,7 +177,7 @@ flowchart TB
     KSAGA -.->|"read: message.save"| DLGS
     DLGR -.->|"write: ответ саге"| KSAGA
     KSAGA -.->|"read: upload.attach"| US
-    US -.->|"write: ответ саге"| KSAGA
+    UPR -.->|"write: ответ саге"| KSAGA
 
     %% Синхронные вызовы генерации
     GW --> PB
@@ -188,7 +206,8 @@ flowchart TB
     US -->|"reserve, commit, release файла"| QS
     US -->|"read/write: uploads"| UR
     US -->|"write: части, S3 Multipart"| CEPH
-    US -.->|"write: upload.assembled, blob.created"| KEV
+    UPR -->|"read: outbox"| UR
+    UPR -.->|"write: upload.assembled, blob.created"| KEV
     KEV -.->|"read: upload.assembled"| CONV
     CONV -->|"read/write: файлы"| CEPH
     CONV -->|"write: status"| UR
@@ -232,6 +251,8 @@ flowchart TB
     %% DWH
     KEV -.->|"read, pull: Kafka engine<br/>request.finished, user.created, model.published"| DWH
     KBIL -.->|"read, pull: subscription.activated"| DWH
+    FA -.->|"write: события клиента"| KFE
+    KFE -.->|"read, pull: Kafka engine"| DWH
 
     %% Мониторинг
     PR -->|"pull: scrape /metrics"| ONLINE
