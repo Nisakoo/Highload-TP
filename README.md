@@ -986,13 +986,14 @@ flowchart TB
         GC["blob<br/>garbage collector"]
     end
 
-    subgraph TRAIN["Контур обучения, раз в месяц"]
+    subgraph TRAIN["Контур обучения"]
         SMP["sampler<br/>0,1% ответов, allow_training"]
         TO["training-orchestrator<br/>оркестратор саги обучения"]
-        TPG[("PostgreSQL<br/>training_samples, datasets,<br/>training_runs, checkpoints, evaluations")]
-        SP["dataset-builder<br/>Spark: очистка, MinHash + LSH"]
-        PT["trainer<br/>PyTorch + DeepSpeed, LoRA"]
-        EV["evaluator<br/>lm-evaluation-harness"]
+        TR["outbox relay"]
+        TPG[("PostgreSQL<br/>training_samples, datasets,<br/>training_runs, checkpoints, evaluations, outbox")]
+        SP["dataset-builder"]
+        PT["trainer"]
+        EV["evaluator"]
     end
 
     CEPH[("Ceph<br/>blobs, временный бакет, статика,<br/>датасеты, checkpoints, адаптеры")]
@@ -1116,7 +1117,8 @@ flowchart TB
     SMP -->|"write: training_samples"| TPG
     SMP -->|"write: тексты, raw"| CEPH
     TO -->|"read/write: runs, datasets"| TPG
-    TO -.->|"write: команды саги"| KTR
+    TR -->|"read: outbox"| TPG
+    TR -.->|"write: команды саги"| KTR
     KTR -.->|"read: ответы"| TO
     KTR -.->|"read: dataset.build"| SP
     KTR -.->|"read: train"| PT
