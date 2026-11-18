@@ -954,6 +954,8 @@ flowchart TB
             GWC["Envoy sidecar<br/>проверка JWT"]
             GW["Inference Gateway<br/>оркестратор саги генерации"]
             PB["prompt-builder"]
+            GWR["outbox relay"]
+            LQ["локальный счетчик квоты"]
             GWDB[("ScyllaDB<br/>saga_log, outbox")]
         end
 
@@ -985,6 +987,10 @@ flowchart TB
         subgraph GPUC["GPU-кластер"]
             subgraph LLMG["llm-service"]
                 SG["SGLang"]
+            end
+
+            subgraph LLMS["llm-service, малая модель"]
+                SGS["SGLang"]
             end
 
             subgraph STTG["stt-service"]
@@ -1028,6 +1034,7 @@ flowchart TB
     KTR[["Kafka: обучение<br/>dataset.build, train, eval, model.publish"]]
     KLOG[["Kafka: логи"]]
     KFE[["Kafka: события фронтенда"]]
+    KDLQ[["Kafka: DLQ"]]
 
     subgraph DWHG["DWH"]
         DWH[("ClickHouse DWH<br/>fact_requests,<br/>справочники users, plans, model_versions")]
@@ -1085,7 +1092,8 @@ flowchart TB
 
     %% Сага генерации ответа
     GW -->|"read/write: состояние саги"| GWDB
-    GW -.->|"write: команды саги с user_id"| KSAGA
+    GWR -->|"read: outbox"| GWDB
+    GWR -.->|"write: команды саги с user_id"| KSAGA
     KSAGA -.->|"read: ответы участников"| GW
     KSAGA -.->|"read: quota.reserve, quota.commit, quota.release"| QS
     QS -.->|"write: ответ саге"| KSAGA
@@ -1098,12 +1106,15 @@ flowchart TB
     GW --> PB
     PB -->|"read/write: контекст"| CTXS
     PB -->|"read: вложения"| CEPH
+    PB -->|"fallback: последние N сообщений"| DLGS
+    GW -->|"fallback: при отказе quota-service"| LQ
     GW -->|"gRPC stream: hash dialog_id"| SG
+    GW -->|"fallback: малая модель"| SGS
     GW -->|"pull: конфиг моделей и доли выкатки"| MR
     GW -->|"least request"| STT
     GW -->|"gRPC stream: текст в аудио"| TTS
     GW -->|"least request"| WS
-    GW -.->|"write: request.finished"| KEV
+    GWR -.->|"write: request.finished"| KEV
 
     QS -->|"read/write: квоты"| QR
 
@@ -1112,6 +1123,7 @@ flowchart TB
     KEV -.->|"read: dialog.deleted"| CTXS
 
     SG -->|"read: веса, LoRA-адаптер"| CEPH
+    SGS -->|"read: веса"| CEPH
     TTS -->|"write: готовое аудио для повтора"| CEPH
 
     WS -->|"read/write: web_cache"| WR
@@ -1154,9 +1166,9 @@ flowchart TB
     TR -->|"read: outbox"| TPG
     TR -.->|"write: команды саги"| KTR
     KTR -.->|"read: ответы"| TO
-    KTR -.->|"read: dataset.build"| SP
-    KTR -.->|"read: train"| PT
-    KTR -.->|"read: eval"| EV
+    KTR -.->|"pull: dataset.build"| SP
+    KTR -.->|"pull: train"| PT
+    KTR -.->|"pull: eval"| EV
     KTR -.->|"read: model.publish"| MR
     SP & PT & EV & MR -.->|"write: ответ саге"| KTR
     SP -->|"read/write: датасеты"| CEPH
@@ -1168,6 +1180,10 @@ flowchart TB
     KBIL -.->|"read, pull: subscription.activated"| DWH
     FA -.->|"write: события клиента"| KFE
     KFE -.->|"read, pull: Kafka engine"| DWH
+
+    %% DLQ
+    ONLINE -.->|"write: после N ретраев"| KDLQ
+    TRAIN -.->|"write: после N ретраев"| KDLQ
 
     %% Мониторинг
     PR -->|"pull: scrape /metrics"| ONLINE
