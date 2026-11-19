@@ -1287,23 +1287,21 @@ flowchart TB
 | NVMe 4 ТБ | 157,9 |
 | HDD 24 ТБ | 135,5 |
 | NVMe для block.db (цена аналога на 6,4 ТБ) | 515 |
-| Сетевая карта 25 GbE | 17,9 |
-| Сетевая карта 10 GbE | 8,4 |
-| Шасси 2U и 1U, б/у | 80,3 |
-| Шасси 4U, б/у | 49,9 |
+
+Другое оборудование (шасси, сетевые карты) в расчетах не учитывали.
 
 | Тип | Расчет цены сервера, тыс. ₽ | Цена, тыс. ₽ | Куплено | Итого, млн ₽ |
 |---|---|---:|---:|---:|
 | gpu-inference, gpu-aux, gpu-train | | 41 700 | 135 | 5 629,5 |
-| kubenode | `2 * 155 + 16 * 40 + 2 * 157,9 + 17,9 + 80,3` | 1 364 | 32 | 43,6 |
-| ceph | `2 * 155 + 8 * 40 + 24 * 135,5 + 3 * 515 + 17,9 + 49,9` | 5 494,8 | 24 | 131,9 |
-| scylla | `2 * 155 + 4 * 40 + 2 * 157,9 + 17,9 + 80,3` | 884 | 76 | 67,2 |
-| postgres | `2 * 155 + 4 * 40 + 2 * 157,9 + 80,3` | 866,1 | 4 | 3,5 |
-| kafka | `2 * 155 + 4 * 40 + 4 * 157,9 + 80,3` | 1 181,9 | 6 | 7,1 |
-| clickhouse | `2 * 155 + 8 * 40 + 4 * 157,9 + 80,3` | 1 341,9 | 4 | 5,4 |
-| dpvs | `155 + 40 + 8,4 + 80,3` | 283,7 | 4 | 1,1 |
-| nginx | `155 + 40 + 8,4 + 80,3` | 283,7 | 4 | 1,1 |
-| **Итого** | | | | **5 890,4** |
+| kubenode | `2 * 155 + 16 * 40 + 2 * 157,9` | 1 265,8 | 32 | 40,5 |
+| ceph | `2 * 155 + 8 * 40 + 24 * 135,5 + 3 * 515` | 5 427 | 24 | 130,2 |
+| scylla | `2 * 155 + 4 * 40 + 2 * 157,9` | 785,8 | 76 | 59,7 |
+| postgres | `2 * 155 + 4 * 40 + 2 * 157,9` | 785,8 | 4 | 3,1 |
+| kafka | `2 * 155 + 4 * 40 + 4 * 157,9` | 1 101,6 | 6 | 6,6 |
+| clickhouse | `2 * 155 + 8 * 40 + 4 * 157,9` | 1 261,6 | 4 | 5,1 |
+| dpvs | `155 + 40` | 195 | 4 | 0,8 |
+| nginx | `155 + 40` | 195 | 4 | 0,8 |
+| **Итого** | | | | **5 876,3** |
 
 Считаем серверы в Москве и СПб (32 kubenode, по 4 dpvs и nginx). Для сверки: за рубежом 8×H100 стоит около $285 тыс.[^22]
 
@@ -1343,6 +1341,6 @@ flowchart TB
 [^18]: [SGLang: Server Arguments](https://docs.sglang.io/advanced_features/server_arguments.html)
 [^19]: [DeepSpeed: Zero Redundancy Optimizer](https://www.deepspeed.ai/tutorials/zero/)
 [^20]: [ServerFlow: серверы 8×H100](https://serverflow.ru/catalog/ai-servers/gpu-servery/h100/)
-[^21]: ServerFlow, комплектующие: [процессоры](https://serverflow.ru/catalog/komplektuyushchie/protsessory/protsessory-intel/xeon-gold-lga4189/), [память](https://serverflow.ru/catalog/komplektuyushchie/operativnaya-pamyat/ddr4-rdimm/), [NVMe U.2](https://serverflow.ru/catalog/komplektuyushchie/ssd-nakopiteli/servernye-u-2-ssd/), [NVMe для баз данных](https://serverflow.ru/catalog/komplektuyushchie/ssd-nakopiteli/ssd-dlya-baz-dannykh/), [HDD](https://serverflow.ru/catalog/komplektuyushchie/hdd-nakopiteli/), [сетевые карты](https://serverflow.ru/catalog/komplektuyushchie/setevye-karty/2-porta/), [корпуса](https://serverflow.ru/catalog/komplektuyushchie/servernye-korpusa/)
+[^21]: ServerFlow, комплектующие: [процессоры](https://serverflow.ru/catalog/komplektuyushchie/protsessory/protsessory-intel/xeon-gold-lga4189/), [память](https://serverflow.ru/catalog/komplektuyushchie/operativnaya-pamyat/ddr4-rdimm/), [NVMe U.2](https://serverflow.ru/catalog/komplektuyushchie/ssd-nakopiteli/servernye-u-2-ssd/), [NVMe для баз данных](https://serverflow.ru/catalog/komplektuyushchie/ssd-nakopiteli/ssd-dlya-baz-dannykh/), [HDD](https://serverflow.ru/catalog/komplektuyushchie/hdd-nakopiteli/)
 [^22]: Сверка с зарубежными ценами: [CloudZero](https://cloudzero.com/blog/h100-gpu-cost/), [GMI Cloud](https://www.gmicloud.ai/blog/nvidia-h100-gpu-pricing-2026-rent-vs-buy-cost-analysis), [SemiAnalysis](https://newsletter.semianalysis.com/p/the-great-gpu-shortage-rental-capacity)
 [^23]: [Yandex Cloud: калькулятор и стоимость аренды, Yandex BareMetal](https://yandex.cloud/ru/prices)
