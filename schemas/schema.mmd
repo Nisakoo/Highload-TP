@@ -8,40 +8,35 @@ flowchart TB
     subgraph ENTRY["Вход"]
         R["Внешняя балансировка (Anycast, GeoDNS)"]
         LB4["DPVS<br/>L4, DR, Maglev"]
-        NG["Nginx<br/>L7, TLS, маршрутизация по домену"]
+        NG["Nginx<br/>L7, TLS, проверка JWT, маршрутизация по домену"]
     end
-
-    ISTIOD["istiod<br/>control plane Istio"]
-
     subgraph ONLINE["Контур инференса"]
         subgraph AUTH["auth-service"]
-            AUTHC["Envoy sidecar"]
             AUTHS["auth"]
             AUTHPG[("PostgreSQL<br/>credentials")]
             AUTHRS[("Redis<br/>sessions")]
         end
 
         subgraph USRG["user-service"]
-            USRC["Envoy sidecar<br/>проверка JWT"]
             USRS["user"]
             USRR["outbox relay"]
             USRPG[("PostgreSQL<br/>users, profiles, settings, outbox")]
         end
 
         subgraph DLG["dialog-service"]
-            DLGC["Envoy sidecar<br/>проверка JWT"]
             DLGS["dialog"]
             DLGR["outbox relay"]
             SC[("ScyllaDB<br/>dialogs, messages, outbox")]
         end
 
         subgraph CHAT["chat-orchestrator"]
-            GWC["Envoy sidecar<br/>проверка JWT"]
-            GW["Inference Gateway<br/>оркестратор саги генерации"]
+            GW["Inference Gateway<br/>оркестратор саги генерации, stateless"]
             PB["prompt-builder"]
-            GWR["outbox relay"]
             LQ["локальный счетчик квоты"]
-            GWDB[("ScyllaDB<br/>saga_log, outbox")]
+        end
+
+        subgraph INF["inference-router"]
+            IR["router<br/>выбор GPU-узла, fallback"]
         end
 
         subgraph QUOTA["quota-service"]
@@ -50,14 +45,12 @@ flowchart TB
         end
 
         subgraph BILL["billing-service"]
-            BSC["Envoy sidecar<br/>проверка JWT"]
             BS["billing<br/>оркестратор саги оплаты"]
             BSR["outbox relay"]
             BPG[("PostgreSQL<br/>plans, subscriptions, payments,<br/>payment_methods, payment_events, refunds, outbox")]
         end
 
         subgraph UPL["upload-service"]
-            USC["Envoy sidecar<br/>проверка JWT"]
             US["upload"]
             CONV["file-converter"]
             UPR["outbox relay"]
@@ -109,6 +102,10 @@ flowchart TB
         SP["dataset-builder"]
         PT["trainer"]
         EV["evaluator"]
+        subgraph GPUT["GPU-кластер обучения"]
+            GT["DeepSpeed"]
+            GE["lm-evaluation-harness"]
+        end
     end
 
     CEPH[("Ceph<br/>blobs, временный бакет, статика,<br/>датасеты, checkpoints, адаптеры")]
@@ -122,6 +119,7 @@ flowchart TB
     KDLQ[["Kafka: DLQ"]]
 
     subgraph DWHG["DWH"]
+        DL["kafka-loader<br/>worker pool"]
         DWH[("ClickHouse DWH<br/>fact_requests,<br/>справочники users, plans, model_versions")]
     end
 
@@ -142,28 +140,21 @@ flowchart TB
     C --> R
     PP -->|"push: вебхуки"| R
     R -->|"BGP + ECMP"| LB4 --> NG
-    NG -->|"auth: регистрация, вход (получение refresh и access токенов)"| AUTHC
-    AUTHC --> AUTHS
-    NG -->|"user: round robin"| USRC
-    NG -->|"dialog: round robin"| DLGC
-    NG -->|"billing: round robin"| BSC
-    NG -->|"вебхуки: проверка подписи провайдера"| BSC
-    NG -->|"upload: least conn"| USC
-    NG -->|"chat, voice: least conn<br/>SSE: push токенов клиенту"| GWC
+    NG -->|"auth: регистрация, вход (получение refresh и access токенов)"| AUTHS
+    NG -->|"user: round robin"| USRS
+    NG -->|"dialog: round robin"| DLGS
+    NG -->|"billing: round robin"| BS
+    NG -->|"вебхуки: проверка подписи провайдера"| BS
+    NG -->|"upload: least conn"| US
+    NG -->|"chat, voice: least conn<br/>SSE: push токенов клиенту"| GW
     NG -->|"статистика: round robin"| FA
-    USRC --> USRS
-    DLGC --> DLGS
-    BSC --> BS
-    USC --> US
-    GWC --> GW
-    ISTIOD -.->|"pull: JWKS, публичные ключи подписи"| AUTHC
-    ISTIOD -.->|"push: JWKS, xDS"| USRC & DLGC & BSC & USC & GWC
 
     %% auth
+    NG -.->|"pull: JWKS, публичные ключи подписи"| AUTHS
     AUTHS -->|"read/write: credentials"| AUTHPG
     AUTHS -->|"read/write: refresh-сессии"| AUTHRS
-    BS -->|"read: проверка сессии при оплате и смене тарифа"| AUTHC
-    AUTHS -->|"write: создание пользователя, идемпотентно по логину"| USRC
+    BS -->|"read: проверка сессии при оплате и смене тарифа"| AUTHS
+    AUTHS -->|"write: создание пользователя, идемпотентно по логину"| USRS
 
     %% user
     USRS -->|"read/write: users, profiles"| USRPG
@@ -176,9 +167,7 @@ flowchart TB
     DLGR -.->|"write: message.completed, dialog.deleted"| KEV
 
     %% Сага генерации ответа
-    GW -->|"read/write: состояние саги"| GWDB
-    GWR -->|"read: outbox"| GWDB
-    GWR -.->|"write: команды саги с user_id"| KSAGA
+    GW -.->|"write: команды саги с user_id"| KSAGA
     KSAGA -.->|"read: ответы участников"| GW
     KSAGA -.->|"read: quota.reserve, quota.commit, quota.release"| QS
     QS -.->|"write: ответ саге"| KSAGA
@@ -192,14 +181,15 @@ flowchart TB
     PB -->|"read/write: контекст"| CTXS
     PB -->|"read: вложения"| CEPH
     PB -->|"fallback: последние N сообщений"| DLGS
+    GW -->|"gRPC stream: запрос генерации"| IR
     GW -->|"fallback: при отказе quota-service"| LQ
-    GW -->|"gRPC stream: hash dialog_id"| SG
-    GW -->|"fallback: малая модель"| SGS
-    GW -->|"pull: конфиг моделей и доли выкатки"| MR
-    GW -->|"least request"| STT
-    GW -->|"gRPC stream: текст в аудио"| TTS
-    GW -->|"least request"| WS
-    GWR -.->|"write: request.finished"| KEV
+    IR -->|"gRPC stream: hash dialog_id"| SG
+    IR -->|"fallback: малая модель"| SGS
+    IR -->|"pull: конфиг моделей и доли выкатки"| MR
+    IR -->|"least request"| STT
+    IR -->|"gRPC stream: текст в аудио"| TTS
+    IR -->|"least request"| WS
+    GW -.->|"write: request.finished"| KEV
 
     QS -->|"read/write: квоты"| QR
 
@@ -259,12 +249,16 @@ flowchart TB
     SP -->|"read/write: датасеты"| CEPH
     PT -->|"read/write: checkpoints"| CEPH
     EV -->|"read: checkpoint"| CEPH
+    PT -->|"запуск обучения"| GT
+    EV -->|"запуск оценки"| GE
 
     %% DWH
-    KEV -.->|"read, pull: Kafka engine<br/>request.finished, user.created, model.published"| DWH
-    KBIL -.->|"read, pull: subscription.activated"| DWH
+    KEV -.->|"read: request.finished, user.created, model.published"| DL
+    KBIL -.->|"read: subscription.activated"| DL
     FA -.->|"write: события клиента"| KFE
-    KFE -.->|"read, pull: Kafka engine"| DWH
+    KFE -.->|"read: события клиента"| DL
+    DL -->|"write: батчи"| DWH
+    DL -->|"write: батчи"| CHL
 
     %% DLQ
     ONLINE -.->|"write: после N ретраев"| KDLQ
@@ -280,10 +274,28 @@ flowchart TB
     TRAIN -->|"push: OTLP трейсы, логи"| OT
     OT -->|"push: трейсы"| TE
     OT -.->|"write: логи"| KLOG
-    KLOG -.->|"read, pull: Kafka engine"| CHL
+    KLOG -.->|"read: логи"| DL
     MI -->|"write: блоки"| CEPH
     TE -->|"write: блоки"| CEPH
     GF -->|"read: PromQL"| MI
     GF -->|"read: TraceQL"| TE
     GF -->|"read: SQL"| CHL
     GF -->|"read: SQL"| DWH
+
+    %% Микросервисы
+    style AUTH fill:#dcfce7,stroke:#16a34a,color:#111
+    style USRG fill:#dcfce7,stroke:#16a34a,color:#111
+    style DLG fill:#dcfce7,stroke:#16a34a,color:#111
+    style CHAT fill:#dcfce7,stroke:#16a34a,color:#111
+    style INF fill:#dcfce7,stroke:#16a34a,color:#111
+    style QUOTA fill:#dcfce7,stroke:#16a34a,color:#111
+    style BILL fill:#dcfce7,stroke:#16a34a,color:#111
+    style UPL fill:#dcfce7,stroke:#16a34a,color:#111
+    style CTX fill:#dcfce7,stroke:#16a34a,color:#111
+    style LLMG fill:#dcfce7,stroke:#16a34a,color:#111
+    style LLMS fill:#dcfce7,stroke:#16a34a,color:#111
+    style STTG fill:#dcfce7,stroke:#16a34a,color:#111
+    style TTSG fill:#dcfce7,stroke:#16a34a,color:#111
+    style WSG fill:#dcfce7,stroke:#16a34a,color:#111
+    style REG fill:#dcfce7,stroke:#16a34a,color:#111
+    style GPUT fill:#dcfce7,stroke:#16a34a,color:#111

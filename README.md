@@ -235,8 +235,8 @@ L7 - Nginx: SSL Termination и маршрутизация по домену
 |---|---|
 | Бэкенды - бэкенды | Round robin |
 | Бэкенды - БД | Запись в мастер, чтение round robin по репликам |
-| Inference Gateway - GPU-узлы | Взвешенный consistent hashing по `dialog_id` |
-| Inference Gateway - веб-поиск, STT, TTS | Least request |
+| inference-router - GPU-узлы | Взвешенный consistent hashing по `dialog_id` |
+| inference-router - веб-поиск, STT, TTS | Least request |
 
 Веса GPU-узлов пропорциональны их фактической скорости генерации; узел с заполненным KV-кэшем временно исключается
 
@@ -646,7 +646,7 @@ dialogs в ScyllaDB: 1,45 млрд строк в год (`18,3 млн / 4,62 * 3
 | ScyllaDB | Драйвер шлет запрос сразу на нужный узел и ядро, в ближайший ЦОД |
 | Redis Cluster | Клиент хранит карту слотов, переходит по `MOVED` |
 | Ceph | Несколько RGW за Nginx, least connections |
-| ClickHouse | Запись пачками через Kafka engine, чтение с любой из двух реплик |
+| ClickHouse | Запись пачками через kafka-loader (worker pool читает Kafka), чтение с любой из двух реплик |
 
 **Резервное копирование:**
 
@@ -883,7 +883,7 @@ y  = W * x + (α / r) * B * (A * x)
 | OpenTelemetry Collector | Прием трейсов и логов со всех сервисов по OTLP, сэмплирование | Fluent Bit, Vector | Одна точка приема по открытому стандарту, отправляет трейсы в Tempo, а логи через Kafka в ClickHouse |
 | Grafana Tempo | Хранение трейсов | Jaeger, Zipkin | Показывает, где задержка на пути Nginx - бэкенд - Gateway - GPU. Индексирует только `trace_id` и хранит в Ceph, поэтому трейсы дешево хранить почти все |
 | Grafana | Дашборды | Kibana, Zabbix | Mimir, Tempo и ClickHouse в одном интерфейсе, переход от графика метрики к трейсу |
-| ClickHouse | Логи и DWH: таблица fact_requests | Elasticsearch, Grafana Loki | Колонки хорошо сжимают логи, агрегаты по миллиардам строк за секунды, читает из Kafka |
+| ClickHouse | Логи и DWH: таблица fact_requests | Elasticsearch, Grafana Loki | Колонки хорошо сжимают логи, агрегаты по миллиардам строк за секунды, пачечная вставка из kafka-loader |
 
 **Тестирование**
 
@@ -910,11 +910,11 @@ y  = W * x + (α / r) * B * (A * x)
 
 | Паттерн | Описание |
 |---|---|
-| Transactional Outbox | Событие или команда саги пишется в таблицу outbox в той же транзакции, что и данные. Relay читает outbox и публикует в Kafka: сообщение не теряется и не уходит без данных. chat-orchestrator и dialog-service (logged batch ScyllaDB), billing и training-orchestrator (транзакция PostgreSQL), upload-service (Redis) |
-| Saga (оркестрация) | Оркестратор хранит состояние саги в своей БД, шлет участникам команды через Kafka и получает ответы в тот же топик. При ошибке запускает компенсацию. chat-orchestrator: `quota.reserve`, `message.save`, `upload.attach`, компенсация `quota.release`. billing: оплата и смена тарифа. training-orchestrator: `dataset.build`, `train`, `eval`, `model.publish` |
+| Transactional Outbox | Событие или команда саги пишется в таблицу outbox в той же транзакции, что и данные. Relay читает outbox и публикует в Kafka: сообщение не теряется и не уходит без данных. dialog-service (logged batch ScyllaDB), user-service, billing и training-orchestrator (транзакция PostgreSQL), upload-service (Redis). chat-orchestrator outbox не использует: у него нет своей БД, команды саги и `request.finished` он пишет в Kafka напрямую, потеря события при падении пода допустима (см. Saga) |
+| Saga (оркестрация) | Оркестратор шлет участникам команды через Kafka и получает ответы. При ошибке запускает компенсацию. billing и training-orchestrator хранят состояние саги в своей БД. chat-orchestrator (Inference Gateway) не хранит: сага длится около 22 с и держится в памяти пода, который держит SSE-поток, а ответы участников приходят в reply-топик этого пода (`pod_id` в команде). Шаги: `quota.reserve`, `message.save`, `upload.attach`, компенсация `quota.release`. Резерв квоты имеет TTL, поэтому при падении пода он снимается сам. Повтор запроса клиентом дедуплицируется по `request_id`. Цена: если под упал после `message.save`, квота вернется по TTL, а строка `request.finished` не попадет в DWH. billing: оплата и смена тарифа. training-orchestrator: `dataset.build`, `train`, `eval`, `model.publish` |
 | Saga (хореография) | Участники сами реагируют на события, координатора нет. Событие `dialog.deleted` обрабатывают context-service (сброс кэша), upload-service (очистка загрузок), blob garbage collector (удаление файлов) и sampler (удаление образцов). Так же работают `upload.assembled` (file-converter) и `user.created` (billing) |
 | Dead Letter Queue | Сообщение, которое не удалось обработать после N повторов, уходит в отдельный топик `Kafka: DLQ` и не блокирует партицию. Разбор и повтор вручную. Применяется к потребителям контуров инференса и обучения. Команды саги в DLQ не уходят: если участник не ответил, оркестратор по таймауту запускает компенсацию |
-| Worker Pull | Воркер сам забирает задачу, когда свободен, а не получает ее от оркестратора. trainer, evaluator и dataset-builder читают команды из `Kafka: обучение`, поэтому GPU обучения не получает вторую задачу, пока не закончила первую. В инференсе, наоборот, push: Gateway сам отправляет запрос на GPU по `hash(dialog_id)`, чтобы переиспользовался KV-кэш SGLang |
+| Worker Pull | Воркер сам забирает задачу, когда свободен, а не получает ее от оркестратора. trainer, evaluator и dataset-builder читают команды из `Kafka: обучение`, поэтому GPU обучения не получает вторую задачу, пока не закончила первую. В инференсе, наоборот, push: inference-router сам отправляет запрос на GPU по `hash(dialog_id)`, чтобы переиспользовался KV-кэш SGLang |
 | Гарантированная доставка | Kafka: RF 3, `acks = all`, consumer group. Событие не теряется при отказе брокера или потребителя, обработка продолжается с последнего закоммиченного offset. Это at-least-once. Гарантию «ровно один раз» реализовать сложно из-за строгих требований: транзакции нужны на всех участниках цепочки. Поэтому берем at-least-once и идемпотентных потребителей (billing: `idempotency_key`, `event_id`) |
 
 #### Graceful degradation
@@ -924,8 +924,8 @@ y  = W * x + (α / r) * B * (A * x)
 | Отключение необязательных функций | Без поиска (circuit breaker на Яндекс Поиск) модель отвечает сама, без TTS ответ приходит текстом. При нехватке GPU приоритет у платных тарифов, а лимиты бесплатного снижаются |
 | Запасной источник контекста | context-service или его Redis недоступны: prompt-builder читает последние N сообщений напрямую из dialog-service (`fallback`). Медленнее, но данные берутся из первоисточника |
 | Запасной счетчик квоты | quota-service недоступен: chat-orchestrator считает лимит локальным счетчиком по последним известным лимитам тарифа, чтобы чат не останавливался. После восстановления накопленное списывается через сагу. Возможно небольшое превышение лимита, поэтому лимит на под берется с запасом, а ботов отсекает `limit_req` в Nginx |
-| Запасная модель | Основная модель перегружена или недоступна: Gateway отвечает малой моделью (`fallback`), она работает на отдельных GPU, чтобы отказ не затронул обе модели. Качество ответа ниже, но сервис продолжает работать |
-| Проверка JWT без auth-service | Sidecar проверяют JWT локально по кэшу JWKS, который istiod заранее рассылает им. При отказе auth-service или istiod авторизованные клиенты продолжают работать до истечения токена, около 5 минут |
+| Запасная модель | Основная модель перегружена или недоступна: inference-router отвечает малой моделью (`fallback`), она работает на отдельных GPU, чтобы отказ не затронул обе модели. Качество ответа ниже, но сервис продолжает работать |
+| Проверка JWT без auth-service | Nginx проверяет JWT локально по кэшу JWKS, который периодически забирает у auth-service. При отказе auth-service авторизованные клиенты продолжают работать до истечения токена, около 5 минут |
 | Работа без user-service | Вход и чат продолжают работать, потому что `user_id` лежит в JWT. Не работают только регистрация и правка профиля |
 
 ---
@@ -943,40 +943,35 @@ flowchart TB
     subgraph ENTRY["Вход"]
         R["Внешняя балансировка (Anycast, GeoDNS)"]
         LB4["DPVS<br/>L4, DR, Maglev"]
-        NG["Nginx<br/>L7, TLS, маршрутизация по домену"]
+        NG["Nginx<br/>L7, TLS, проверка JWT, маршрутизация по домену"]
     end
-
-    ISTIOD["istiod<br/>control plane Istio"]
-
     subgraph ONLINE["Контур инференса"]
         subgraph AUTH["auth-service"]
-            AUTHC["Envoy sidecar"]
             AUTHS["auth"]
             AUTHPG[("PostgreSQL<br/>credentials")]
             AUTHRS[("Redis<br/>sessions")]
         end
 
         subgraph USRG["user-service"]
-            USRC["Envoy sidecar<br/>проверка JWT"]
             USRS["user"]
             USRR["outbox relay"]
             USRPG[("PostgreSQL<br/>users, profiles, settings, outbox")]
         end
 
         subgraph DLG["dialog-service"]
-            DLGC["Envoy sidecar<br/>проверка JWT"]
             DLGS["dialog"]
             DLGR["outbox relay"]
             SC[("ScyllaDB<br/>dialogs, messages, outbox")]
         end
 
         subgraph CHAT["chat-orchestrator"]
-            GWC["Envoy sidecar<br/>проверка JWT"]
-            GW["Inference Gateway<br/>оркестратор саги генерации"]
+            GW["Inference Gateway<br/>оркестратор саги генерации, stateless"]
             PB["prompt-builder"]
-            GWR["outbox relay"]
             LQ["локальный счетчик квоты"]
-            GWDB[("ScyllaDB<br/>saga_log, outbox")]
+        end
+
+        subgraph INF["inference-router"]
+            IR["router<br/>выбор GPU-узла, fallback"]
         end
 
         subgraph QUOTA["quota-service"]
@@ -985,14 +980,12 @@ flowchart TB
         end
 
         subgraph BILL["billing-service"]
-            BSC["Envoy sidecar<br/>проверка JWT"]
             BS["billing<br/>оркестратор саги оплаты"]
             BSR["outbox relay"]
             BPG[("PostgreSQL<br/>plans, subscriptions, payments,<br/>payment_methods, payment_events, refunds, outbox")]
         end
 
         subgraph UPL["upload-service"]
-            USC["Envoy sidecar<br/>проверка JWT"]
             US["upload"]
             CONV["file-converter"]
             UPR["outbox relay"]
@@ -1044,6 +1037,10 @@ flowchart TB
         SP["dataset-builder"]
         PT["trainer"]
         EV["evaluator"]
+        subgraph GPUT["GPU-кластер обучения"]
+            GT["DeepSpeed"]
+            GE["lm-evaluation-harness"]
+        end
     end
 
     CEPH[("Ceph<br/>blobs, временный бакет, статика,<br/>датасеты, checkpoints, адаптеры")]
@@ -1057,6 +1054,7 @@ flowchart TB
     KDLQ[["Kafka: DLQ"]]
 
     subgraph DWHG["DWH"]
+        DL["kafka-loader<br/>worker pool"]
         DWH[("ClickHouse DWH<br/>fact_requests,<br/>справочники users, plans, model_versions")]
     end
 
@@ -1077,28 +1075,21 @@ flowchart TB
     C --> R
     PP -->|"push: вебхуки"| R
     R -->|"BGP + ECMP"| LB4 --> NG
-    NG -->|"auth: регистрация, вход (получение refresh и access токенов)"| AUTHC
-    AUTHC --> AUTHS
-    NG -->|"user: round robin"| USRC
-    NG -->|"dialog: round robin"| DLGC
-    NG -->|"billing: round robin"| BSC
-    NG -->|"вебхуки: проверка подписи провайдера"| BSC
-    NG -->|"upload: least conn"| USC
-    NG -->|"chat, voice: least conn<br/>SSE: push токенов клиенту"| GWC
+    NG -->|"auth: регистрация, вход (получение refresh и access токенов)"| AUTHS
+    NG -->|"user: round robin"| USRS
+    NG -->|"dialog: round robin"| DLGS
+    NG -->|"billing: round robin"| BS
+    NG -->|"вебхуки: проверка подписи провайдера"| BS
+    NG -->|"upload: least conn"| US
+    NG -->|"chat, voice: least conn<br/>SSE: push токенов клиенту"| GW
     NG -->|"статистика: round robin"| FA
-    USRC --> USRS
-    DLGC --> DLGS
-    BSC --> BS
-    USC --> US
-    GWC --> GW
-    ISTIOD -.->|"pull: JWKS, публичные ключи подписи"| AUTHC
-    ISTIOD -.->|"push: JWKS, xDS"| USRC & DLGC & BSC & USC & GWC
 
     %% auth
+    NG -.->|"pull: JWKS, публичные ключи подписи"| AUTHS
     AUTHS -->|"read/write: credentials"| AUTHPG
     AUTHS -->|"read/write: refresh-сессии"| AUTHRS
-    BS -->|"read: проверка сессии при оплате и смене тарифа"| AUTHC
-    AUTHS -->|"write: создание пользователя, идемпотентно по логину"| USRC
+    BS -->|"read: проверка сессии при оплате и смене тарифа"| AUTHS
+    AUTHS -->|"write: создание пользователя, идемпотентно по логину"| USRS
 
     %% user
     USRS -->|"read/write: users, profiles"| USRPG
@@ -1111,9 +1102,7 @@ flowchart TB
     DLGR -.->|"write: message.completed, dialog.deleted"| KEV
 
     %% Сага генерации ответа
-    GW -->|"read/write: состояние саги"| GWDB
-    GWR -->|"read: outbox"| GWDB
-    GWR -.->|"write: команды саги с user_id"| KSAGA
+    GW -.->|"write: команды саги с user_id"| KSAGA
     KSAGA -.->|"read: ответы участников"| GW
     KSAGA -.->|"read: quota.reserve, quota.commit, quota.release"| QS
     QS -.->|"write: ответ саге"| KSAGA
@@ -1127,14 +1116,15 @@ flowchart TB
     PB -->|"read/write: контекст"| CTXS
     PB -->|"read: вложения"| CEPH
     PB -->|"fallback: последние N сообщений"| DLGS
+    GW -->|"gRPC stream: запрос генерации"| IR
     GW -->|"fallback: при отказе quota-service"| LQ
-    GW -->|"gRPC stream: hash dialog_id"| SG
-    GW -->|"fallback: малая модель"| SGS
-    GW -->|"pull: конфиг моделей и доли выкатки"| MR
-    GW -->|"least request"| STT
-    GW -->|"gRPC stream: текст в аудио"| TTS
-    GW -->|"least request"| WS
-    GWR -.->|"write: request.finished"| KEV
+    IR -->|"gRPC stream: hash dialog_id"| SG
+    IR -->|"fallback: малая модель"| SGS
+    IR -->|"pull: конфиг моделей и доли выкатки"| MR
+    IR -->|"least request"| STT
+    IR -->|"gRPC stream: текст в аудио"| TTS
+    IR -->|"least request"| WS
+    GW -.->|"write: request.finished"| KEV
 
     QS -->|"read/write: квоты"| QR
 
@@ -1144,7 +1134,7 @@ flowchart TB
 
     SG -->|"read: веса, LoRA-адаптер"| CEPH
     SGS -->|"read: веса"| CEPH
-    TTS -->|"write: кэш аудио на 7 дней"| CEPH
+    TTS -->|"write: готовое аудио для повтора"| CEPH
 
     WS -->|"read/write: web_cache"| WR
     WS -->|"read: circuit breaker"| YS
@@ -1194,12 +1184,16 @@ flowchart TB
     SP -->|"read/write: датасеты"| CEPH
     PT -->|"read/write: checkpoints"| CEPH
     EV -->|"read: checkpoint"| CEPH
+    PT -->|"запуск обучения"| GT
+    EV -->|"запуск оценки"| GE
 
     %% DWH
-    KEV -.->|"read, pull: Kafka engine<br/>request.finished, user.created, model.published"| DWH
-    KBIL -.->|"read, pull: subscription.activated"| DWH
+    KEV -.->|"read: request.finished, user.created, model.published"| DL
+    KBIL -.->|"read: subscription.activated"| DL
     FA -.->|"write: события клиента"| KFE
-    KFE -.->|"read, pull: Kafka engine"| DWH
+    KFE -.->|"read: события клиента"| DL
+    DL -->|"write: батчи"| DWH
+    DL -->|"write: батчи"| CHL
 
     %% DLQ
     ONLINE -.->|"write: после N ретраев"| KDLQ
@@ -1215,13 +1209,31 @@ flowchart TB
     TRAIN -->|"push: OTLP трейсы, логи"| OT
     OT -->|"push: трейсы"| TE
     OT -.->|"write: логи"| KLOG
-    KLOG -.->|"read, pull: Kafka engine"| CHL
+    KLOG -.->|"read: логи"| DL
     MI -->|"write: блоки"| CEPH
     TE -->|"write: блоки"| CEPH
     GF -->|"read: PromQL"| MI
     GF -->|"read: TraceQL"| TE
     GF -->|"read: SQL"| CHL
     GF -->|"read: SQL"| DWH
+
+    %% Микросервисы
+    style AUTH fill:#dcfce7,stroke:#16a34a,color:#111
+    style USRG fill:#dcfce7,stroke:#16a34a,color:#111
+    style DLG fill:#dcfce7,stroke:#16a34a,color:#111
+    style CHAT fill:#dcfce7,stroke:#16a34a,color:#111
+    style INF fill:#dcfce7,stroke:#16a34a,color:#111
+    style QUOTA fill:#dcfce7,stroke:#16a34a,color:#111
+    style BILL fill:#dcfce7,stroke:#16a34a,color:#111
+    style UPL fill:#dcfce7,stroke:#16a34a,color:#111
+    style CTX fill:#dcfce7,stroke:#16a34a,color:#111
+    style LLMG fill:#dcfce7,stroke:#16a34a,color:#111
+    style LLMS fill:#dcfce7,stroke:#16a34a,color:#111
+    style STTG fill:#dcfce7,stroke:#16a34a,color:#111
+    style TTSG fill:#dcfce7,stroke:#16a34a,color:#111
+    style WSG fill:#dcfce7,stroke:#16a34a,color:#111
+    style REG fill:#dcfce7,stroke:#16a34a,color:#111
+    style GPUT fill:#dcfce7,stroke:#16a34a,color:#111
 ```
 
 ---
