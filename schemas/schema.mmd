@@ -32,11 +32,12 @@ flowchart TB
         subgraph CHAT["chat-orchestrator"]
             GW["Inference Gateway<br/>оркестратор саги генерации, stateless"]
             PB["prompt-builder"]
+            EXT["упрощённый разбор<br/>TXT, DOCX, PDF"]
             LQ["локальный счетчик квоты"]
         end
 
         subgraph INF["inference-router"]
-            IR["router<br/>выбор GPU-узла, fallback"]
+            IR["router<br/>выбор GPU-узла, снимок конфига"]
         end
 
         subgraph QUOTA["quota-service"]
@@ -150,7 +151,7 @@ flowchart TB
     NG -->|"статистика: round robin"| FA
 
     %% auth
-    NG -.->|"pull: JWKS, публичные ключи подписи"| AUTHS
+    NG -.->|"pull: JWKS, снимок публичных ключей подписи"| AUTHS
     AUTHS -->|"read/write: credentials"| AUTHPG
     AUTHS -->|"read/write: refresh-сессии"| AUTHRS
     BS -->|"read: проверка сессии при оплате и смене тарифа"| AUTHS
@@ -180,12 +181,14 @@ flowchart TB
     GW --> PB
     PB -->|"read/write: контекст"| CTXS
     PB -->|"read: вложения"| CEPH
+    PB -->|"fallback: вложение без file-converter"| EXT
+    EXT -->|"read: оригинал файла"| CEPH
     PB -->|"fallback: последние N сообщений"| DLGS
     GW -->|"gRPC stream: запрос генерации"| IR
     GW -->|"fallback: при отказе quota-service"| LQ
     IR -->|"gRPC stream: hash dialog_id"| SG
     IR -->|"fallback: малая модель"| SGS
-    IR -->|"pull: конфиг моделей и доли выкатки"| MR
+    KEV -.->|"read: model.published, снимок конфига моделей и доли выкатки"| IR
     IR -->|"least request"| STT
     IR -->|"gRPC stream: текст в аудио"| TTS
     IR -->|"least request"| WS
@@ -222,6 +225,7 @@ flowchart TB
     BSR -.->|"write: команды саги, subscription.activated"| KBIL
     KBIL -.->|"read: ответы"| BS
     KBIL -.->|"read: quota.limits"| QS
+    KBIL -.->|"read: quota.limits, снимок лимитов"| LQ
     QS -.->|"write: ответ саге"| KBIL
     KEV -.->|"read: user.created"| BS
 
