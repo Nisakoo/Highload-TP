@@ -1228,17 +1228,6 @@ flowchart TB
 
 ### 11. Список серверов
 
-**Допущения:**
-- Go-сервисы: легкий API - 1 000 RPS на ядро, средняя логика - 100 RPS на ядро, вход с хешированием пароля - 10 RPS на ядро. Накладные расходы контейнеров и sidecar Envoy - 50%, для TTS без sidecar их не добавляем
-- Узел 8×H100 с моделью 70B (`--tp 8`) выдает 8 000 выходных токенов/с при ~50 токенах/с на пользователя. На prefill - около 23 000 токенов/с (40% от пиковых 7,9 PFLOPS)
-- Silero синтезирует речь в 50 раз быстрее реального времени на одно ядро
-- Whisper занимает 2 узла 8×GPU на ЦОД
-- В Москве и СПб ставим свое железо, в Новосибирске и Хабаровске арендуем bare metal. На физические серверы переводим сервис, которому нужно 6 и более серверов. Исключения - GPU и базы данных, где виртуализация дает оверхед
-
-**GPU:**
-
-Декод: `850 416 / 8 000 = 107` узлов. Prefill: `388 906 / 23 000 = 17` узлов. Итого 124, по 62 на ЦОД, с N+1 - 126 узлов. При отказе GPU-ЦОД второй держит половину нагрузки, остальное закрывает деградация из раздела 9: малая модель и приоритет платных тарифов
-
 **Kubernetes:**
 
 | Сервис | Пиковая нагрузка | CPU request / limit | RAM request / limit | Реплик на ЦОД |
@@ -1257,57 +1246,47 @@ flowchart TB
 | Redis: 9 шардов с репликами и sessions | 77 ГБ данных | 1 / 2 | 16 / 20 ГБ | 23 |
 | Мониторинг, Spark, остальное | - | ~100 ядер | - | - |
 
-Всего около 790 ядер. На kubenode полезно ~50 ядер из 64, поэтому на всю нагрузку нужно 16 узлов. Каждый GPU-ЦОД держит 100% CPU-нагрузки: 16 + 16 узлов, плюс по 2 узла в регионах для auth и api
+Всего ~790 ядер: 16 kubenode на ЦОД, плюс по 2 в регионах
 
 **Серверы:**
 
 | Тип | Конфигурация | Кол-во | Размещение | Сервисы |
 |---|---|---:|---|---|
-| gpu-inference | 8×H100 80 ГБ, 2×48 ядер, 256 ГБ RAM, 2×100 GbE | 126 | 63 + 63 | SGLang, основная модель |
-| gpu-aux | 8×H100 80 ГБ, 2×48 ядер, 256 ГБ RAM | 8 | 4 + 4 | Малая модель, Whisper |
-| gpu-train | 8×H100 80 ГБ, 2×48 ядер, 256 ГБ RAM | 1 | Москва | DeepSpeed, LoRA |
-| kubenode | 2×32 ядра, 512 ГБ, 2×NVMe 4 ТБ, 2×25 GbE | 36 | 16 + 16 + 2 + 2 | Сервисы из таблицы Kubernetes |
-| ceph | 2×16 ядер, 256 ГБ, 24×HDD 24 ТБ, 3×NVMe 7,68 ТБ (block.db), 2×25 GbE | 24 | 12 + 12 | blobs, временный бакет, бэкапы |
-| scylla | 2×16 ядер, 128 ГБ, 2×NVMe 4 ТБ, 2×25 GbE | 76 | 38 + 38 | messages, dialogs |
-| postgres | 32 ядра, 128 ГБ, 2×NVMe 4 ТБ | 4 | 2 + 2 | 5 кластеров Patroni |
-| kafka | 32 ядра, 128 ГБ, 4×NVMe 4 ТБ | 6 | 3 + 3 | Брокеры Kafka |
-| clickhouse | 32 ядра, 256 ГБ, 4×NVMe 4 ТБ | 4 | 2 + 2 | DWH, логи |
-| dpvs | 16 ядер, 32 ГБ, 10 GbE | 8 | по 2 в каждом ДЦ | L4-балансировка |
-| nginx | 16 ядер, 32 ГБ, 10 GbE | 8 | по 2 в каждом ДЦ | L7, TLS |
+| gpu-inference | Supermicro SYS-821GE-TNHR, 2×Xeon Platinum 8468, 8×H100, 2 ТБ RAM, 8×400GbE, 2×NVMe 960 ГБ, 2×NVMe 7,68 ТБ | 126 | 63 + 63 | SGLang, основная модель |
+| gpu-aux | Supermicro SYS-821GE-TNHR, 2×Xeon Platinum 8468, 8×H100, 2 ТБ RAM, 8×400GbE, 2×NVMe 960 ГБ, 2×NVMe 7,68 ТБ | 8 | 4 + 4 | Малая модель, Whisper |
+| gpu-train | Supermicro SYS-821GE-TNHR, 2×Xeon Platinum 8468, 8×H100, 2 ТБ RAM, 8×400GbE, 2×NVMe 960 ГБ, 2×NVMe 7,68 ТБ | 1 | Москва | DeepSpeed, LoRA |
+| kubenode | Gigabyte R283-Z96-ACJ1, 2×EPYC 9335 (64 ядра), 512 ГБ, 2×NVMe 3,84 ТБ, 2×25GbE | 36 | 16 + 16 + 2 + 2 | Сервисы из таблицы Kubernetes |
+| ceph | CyberStore 424A, 2×Xeon Silver 4510, 256 ГБ, 24×HDD 24 ТБ, 2×M.2 1,92 ТБ, 2×25GbE | 24 | 12 + 12 | blobs, временный бакет, бэкапы |
+| scylla | Gigabyte R263-Z36-ACE1, 1×EPYC 9335 (32 ядра), 128 ГБ, 2×NVMe 3,84 ТБ, 2×25GbE | 76 | 38 + 38 | messages, dialogs |
+| postgres | Gigabyte R263-Z36-ACE1, 1×EPYC 9335 (32 ядра), 128 ГБ, 2×NVMe 3,84 ТБ, 2×25GbE | 4 | 2 + 2 | 5 кластеров Patroni |
+| kafka | Gigabyte R263-Z36-ACE1, 1×EPYC 9335 (32 ядра), 128 ГБ, 4×NVMe 3,84 ТБ, 2×25GbE | 6 | 3 + 3 | Брокеры Kafka |
+| clickhouse | Gigabyte R263-Z36-ACE1, 1×EPYC 9335 (32 ядра), 256 ГБ, 4×NVMe 3,84 ТБ, 2×25GbE | 4 | 2 + 2 | DWH, логи |
+| dpvs | Gigabyte E163-Z34, 1×EPYC 9124 (16 ядер), 32 ГБ, 2×10GbE | 8 | по 2 в каждом ДЦ | L4-балансировка |
+| nginx | Gigabyte E163-Z34, 1×EPYC 9124 (16 ядер), 32 ГБ, 2×10GbE | 8 | по 2 в каждом ДЦ | L7, TLS |
 | **Итого** | | **301** | | 135 GPU-узлов, 1 080 H100 |
+
+GPU-серверы - ServerFlow[^20], остальные - Broadberry[^21]
+
+Связность: NVLink и NVSwitch внутри GPU-узла, между узлами 400GbE (InfiniBand или RoCE, leaf-spine, по карте на GPU)
 
 **Расчет стоимости:**
 
-Цены по прайсам российских поставщиков, с НДС 22%. GPU-сервер 8×H100 - 41,7 млн ₽ (среднее по 9 моделям)[^20]. Остальные серверы собраны из комплектующих[^21]:
+| Тип | Цена сервера, € без НДС | Цена сервера, тыс. ₽ с НДС | Куплено | Итого, млн ₽ |
+|---|---:|---:|---:|---:|
+| gpu-inference, gpu-aux, gpu-train | - | 59 870,8 | 135 | 8 082,6 |
+| kubenode | 48 366,19 | 5 327,2 | 32 | 170,5 |
+| ceph | 57 613,20 | 6 345,7 | 24 | 152,3 |
+| scylla | 23 226,02 | 2 558,2 | 76 | 194,4 |
+| postgres | 23 226,02 | 2 558,2 | 4 | 10,2 |
+| kafka | 29 454,10 | 3 244,2 | 6 | 19,5 |
+| clickhouse | 39 659,82 | 4 368,3 | 4 | 17,5 |
+| dpvs | 6 223,95 | 685,5 | 4 | 2,7 |
+| nginx | 6 223,95 | 685,5 | 4 | 2,7 |
+| **Итого** | | | | **8 652,4** |
 
-| Комплектующее | Цена, тыс. ₽ |
-|---|---:|
-| Процессор (цена Xeon Gold, 32-ядерных в каталоге нет) | 155 |
-| Память 32 ГБ | 40 |
-| NVMe 4 ТБ | 157,9 |
-| HDD 24 ТБ | 135,5 |
-| NVMe для block.db (цена аналога на 6,4 ТБ) | 515 |
+Цены с НДС 22%. Broadberry в евро без НДС пересчитан по курсу ЦБ 90,2815 ₽ за евро на 24.11.2026[^22].
 
-Другое оборудование (шасси, сетевые карты) в расчетах не учитывали.
-
-| Тип | Расчет цены сервера, тыс. ₽ | Цена, тыс. ₽ | Куплено | Итого, млн ₽ |
-|---|---|---:|---:|---:|
-| gpu-inference, gpu-aux, gpu-train | | 41 700 | 135 | 5 629,5 |
-| kubenode | `2 * 155 + 16 * 40 + 2 * 157,9` | 1 265,8 | 32 | 40,5 |
-| ceph | `2 * 155 + 8 * 40 + 24 * 135,5 + 3 * 515` | 5 427 | 24 | 130,2 |
-| scylla | `2 * 155 + 4 * 40 + 2 * 157,9` | 785,8 | 76 | 59,7 |
-| postgres | `2 * 155 + 4 * 40 + 2 * 157,9` | 785,8 | 4 | 3,1 |
-| kafka | `2 * 155 + 4 * 40 + 4 * 157,9` | 1 101,6 | 6 | 6,6 |
-| clickhouse | `2 * 155 + 8 * 40 + 4 * 157,9` | 1 261,6 | 4 | 5,1 |
-| dpvs | `155 + 40` | 195 | 4 | 0,8 |
-| nginx | `155 + 40` | 195 | 4 | 0,8 |
-| **Итого** | | | | **5 876,3** |
-
-Считаем серверы в Москве и СПб (32 kubenode, по 4 dpvs и nginx). Для сверки: за рубежом 8×H100 стоит около $285 тыс.[^22]
-
-**Новосибирск, Хабаровск:**
-
-Аренда bare metal в Yandex BareMetal, цены с НДС[^23].
+**Новосибирск, Хабаровск** (Yandex BareMetal[^23]):
 
 | Тип | Конфигурация | Цена, ₽/мес | Арендуется | Итого, ₽/мес |
 |---|---|---:|---:|---:|
@@ -1315,11 +1294,19 @@ flowchart TB
 | dpvs, nginx | 2 × Xeon E5-2660, 16 ядер, 32 ГБ | 14 950 | 8 | 119 600 |
 | **Итого** | | | 12 | **783 968** |
 
-Аренда в регионах - около 0,78 млн ₽ в месяц, около 9,4 млн ₽ в год.
+**Сравнение: покупка и аренда на 5 лет** (Yandex[^23], Selectel[^24]):
 
-**Сравнение стоимости**
+| Роль | Аналог для аренды | Цена аренды, ₽/мес | Кол-во | Аренда, млн ₽/мес | Аренда за 5 лет, млн ₽ | Покупка, млн ₽ |
+|---|---|---:|---:|---:|---:|---:|
+| GPU-узлы | Yandex Cloud, платформа Gen2: 8 GPU, 180 vCPU, 1 440 ГБ RAM | 4 778 173 | 135 | 645,05 | 38 703,2 | 8 082,6 |
+| kubenode | BareMetal BA-i511-NH-25G: 2×Xeon Gold 6338, 512 ГБ | 166 092 | 32 | 5,31 | 318,9 | 170,5 |
+| scylla, postgres, kafka, clickhouse | BareMetal HA-a703-4N-2X25G: 2×EPYC 9374F, 768 ГБ, NVMe | 195 733 | 90 | 17,62 | 1 057,0 | 241,6 |
+| dpvs, nginx | BareMetal LA-i102-S: 2×Xeon E5-2660, 128 ГБ | 15 900 | 8 | 0,13 | 7,6 | 5,4 |
+| **Итого** | | | | **668,11** | **40 086,7** | **8 500,1** |
 
-Своё железо дешевле: 32 сервера kubenode стоят 40 млн ₽, а арендовать такие же 5,3 млн ₽ в месяц, то есть 64 млн ₽ в год (расчеты сделаны на основе таблиц выше). 0 млн ₽ за 32 сервера делим на пять лет — это 8 млн ₽ в год, или 667 тыс ₽ в месяц
+Покупка дешевле в 4,7 раза (на 31,6 млрд ₽ за 5 лет) и окупается за 12,7 месяца. Yandex не раскрывает GPU платформы Gen2, у Selectel 8×H200 стоит 9,5 млн ₽ в месяц, поэтому сравнение GPU приблизительное
+
+![Стоимость покупки и аренды за 5 лет](schemas/cost_chart.png)
 
 ---
 
@@ -1344,7 +1331,8 @@ flowchart TB
 [^17]: [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685)
 [^18]: [SGLang: Server Arguments](https://docs.sglang.io/advanced_features/server_arguments.html)
 [^19]: [DeepSpeed: Zero Redundancy Optimizer](https://www.deepspeed.ai/tutorials/zero/)
-[^20]: [ServerFlow: серверы 8×H100](https://serverflow.ru/catalog/ai-servers/gpu-servery/h100/)
-[^21]: ServerFlow, комплектующие: [процессоры](https://serverflow.ru/catalog/komplektuyushchie/protsessory/protsessory-intel/xeon-gold-lga4189/), [память](https://serverflow.ru/catalog/komplektuyushchie/operativnaya-pamyat/ddr4-rdimm/), [NVMe U.2](https://serverflow.ru/catalog/komplektuyushchie/ssd-nakopiteli/servernye-u-2-ssd/), [NVMe для баз данных](https://serverflow.ru/catalog/komplektuyushchie/ssd-nakopiteli/ssd-dlya-baz-dannykh/), [HDD](https://serverflow.ru/catalog/komplektuyushchie/hdd-nakopiteli/)
-[^22]: Сверка с зарубежными ценами: [CloudZero](https://cloudzero.com/blog/h100-gpu-cost/), [GMI Cloud](https://www.gmicloud.ai/blog/nvidia-h100-gpu-pricing-2026-rent-vs-buy-cost-analysis), [SemiAnalysis](https://newsletter.semianalysis.com/p/the-great-gpu-shortage-rental-capacity)
+[^20]: [ServerFlow: серверы NVIDIA HGX H100](https://serverflow.ru/catalog/ai-servers/gpu-servery/servery-nvidia-hgx/hgx-h100/)
+[^21]: [Broadberry: конфигуратор серверов](https://www.broadberry.eu/rackmount-servers), страницы [CyberServe EPYC EP2 224](https://www.broadberry.eu/amd-epyc-9004-rackmount-servers/cyberserve-epyc-ep2-224-nvme-g5), [EP1 224](https://www.broadberry.eu/amd-epyc-9004-rackmount-servers/cyberserve-epyc-ep1-224-24nvme-g-g5), [EP1 102-G](https://www.broadberry.eu/amd-epyc-9004-rackmount-servers/cyberserve-epyc-ep1-102-g-nvme-g5), [CyberStore 424A](https://www.broadberry.eu/storage-storage-servers/cyberstore-424a)
+[^22]: [Банк России: официальные курсы валют](https://www.cbr.ru/currency_base/daily/), евро на 24.11.2026
 [^23]: [Yandex Cloud: калькулятор и стоимость аренды, Yandex BareMetal](https://yandex.cloud/ru/prices)
+[^24]: [Selectel: калькулятор цен, выделенные серверы](https://selectel.ru/prices/)
