@@ -14,13 +14,13 @@
     :root:not([data-theme="light"]) {
       --bg: #14161b; --panel: #1d2028; --text: #e6e8ee; --muted: #9aa1b2;
       --border: #333847; --accent: #6f9bff; --accent-soft: rgba(111,155,255,.18);
-      --err: #ff6b6b;
+      --canvas: #1a1c22; --err: #ff6b6b;
     }
   }
   :root[data-theme="dark"] {
     --bg: #14161b; --panel: #1d2028; --text: #e6e8ee; --muted: #9aa1b2;
     --border: #333847; --accent: #6f9bff; --accent-soft: rgba(111,155,255,.18);
-    --err: #ff6b6b;
+    --canvas: #1a1c22; --err: #ff6b6b;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
@@ -74,7 +74,7 @@
   #toast.show { opacity: 1; transform: translate(-50%, 0); }
   #toast.err { border-color: var(--err); color: var(--err); }
 
-  #minimap { position: fixed; right: 14px; bottom: 14px; width: 260px; background: var(--canvas);
+  #minimap { position: fixed; right: 14px; bottom: 14px; width: 260px; background: var(--panel);
     border: 1px solid var(--border); border-radius: 8px; overflow: hidden; box-shadow: 0 4px 16px rgba(0,0,0,.12);
     z-index: 5; cursor: pointer; }
   #minimap svg { display: block; width: 100%; height: auto; max-width: none !important; pointer-events: none; }
