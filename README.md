@@ -919,7 +919,7 @@ y  = W * x + (α / r) * B * (A * x)
 [Открыть схему в PNG](schemas/schema.png)
 
 ```mermaid
-%%{init: {"theme": "neutral", "flowchart": {"curve": "linear", "nodeSpacing": 25, "rankSpacing": 50}}}%%
+%%{init: {"theme": "neutral", "flowchart": {"curve": "basis", "nodeSpacing": 25, "rankSpacing": 50}}}%%
 flowchart TB
     C["Клиент"]
     CDN["CDN<br/>статика"]
