@@ -1,0 +1,544 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Схема проекта</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #6b7385;
+    --border: #d9dde5; --accent: #2f6bff; --accent-soft: rgba(47,107,255,.12);
+    --canvas: #ffffff; --err: #c62828;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14161b; --panel: #1d2028; --text: #e6e8ee; --muted: #9aa1b2;
+      --border: #333847; --accent: #6f9bff; --accent-soft: rgba(111,155,255,.18);
+      --err: #ff6b6b;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #14161b; --panel: #1d2028; --text: #e6e8ee; --muted: #9aa1b2;
+    --border: #333847; --accent: #6f9bff; --accent-soft: rgba(111,155,255,.18);
+    --err: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
+
+  #toolbar { position: fixed; top: 0; left: 0; right: 0; height: 48px; display: flex; align-items: center;
+    gap: 6px; padding: 0 12px; background: var(--panel); border-bottom: 1px solid var(--border); z-index: 10; }
+  #toolbar .sep { width: 1px; height: 24px; background: var(--border); margin: 0 4px; }
+  button, .btn { height: 30px; min-width: 30px; padding: 0 10px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--panel); color: var(--text); font: inherit; cursor: pointer; white-space: nowrap; flex: none; }
+  #toolbar .sep { flex: none; }
+  button:hover { border-color: var(--accent); }
+  button.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+  #zoomLabel { min-width: 58px; font-variant-numeric: tabular-nums; }
+  #searchWrap { position: relative; margin-left: auto; }
+  #search { height: 30px; width: 240px; padding: 0 10px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--bg); color: var(--text); font: inherit; }
+  #search:focus { outline: none; border-color: var(--accent); }
+  #results { position: absolute; top: 34px; right: 0; width: 320px; max-height: 360px; overflow: auto;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.15);
+    display: none; }
+  #results div { padding: 6px 10px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #results div.active, #results div:hover { background: var(--accent-soft); }
+  #results small { color: var(--muted); margin-left: 6px; }
+  #status { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    flex: 1 1 0; min-width: 0; }
+  #searchWrap { flex: none; }
+  #status.err { color: var(--err); }
+
+  #viewport { position: fixed; top: 48px; left: 0; right: 0; bottom: 0; overflow: hidden; cursor: grab;
+    background: var(--canvas); touch-action: none; }
+  #viewport.panning { cursor: grabbing; }
+  #stage { position: absolute; top: 0; left: 0; transform-origin: 0 0; }
+  #stage svg { display: block; max-width: none !important; }
+
+  /* Подсветка связей */
+  #stage.focus .flowchart-link { opacity: .07; }
+  #stage.focus .edgeLabels > g { opacity: .12; }
+  #stage.focus g.node { opacity: .2; }
+  #stage.focus g.cluster { opacity: .45; }
+  #stage.focus .flowchart-link.hl { opacity: 1; stroke: var(--accent) !important; stroke-width: 2.5px !important; }
+  #stage.focus .edgeLabels > g.hl { opacity: 1; }
+  #stage.focus g.node.hl, #stage.focus g.cluster.hl { opacity: 1; }
+  #stage g.node.sel rect, #stage g.node.sel path, #stage g.node.sel polygon,
+  #stage g.cluster.sel rect { stroke: var(--accent) !important; stroke-width: 3px !important; }
+  #stage g.node { cursor: pointer; }
+
+  #toast { position: fixed; left: 50%; bottom: 22px; transform: translate(-50%, 20px); opacity: 0; pointer-events: none;
+    background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 14px; box-shadow: 0 6px 20px rgba(0,0,0,.18); transition: opacity .2s, transform .2s; z-index: 40; }
+  #toast.show { opacity: 1; transform: translate(-50%, 0); }
+  #toast.err { border-color: var(--err); color: var(--err); }
+
+  #minimap { position: fixed; right: 14px; bottom: 14px; width: 260px; background: var(--canvas);
+    border: 1px solid var(--border); border-radius: 8px; overflow: hidden; box-shadow: 0 4px 16px rgba(0,0,0,.12);
+    z-index: 5; cursor: pointer; }
+  #minimap svg { display: block; width: 100%; height: auto; max-width: none !important; pointer-events: none; }
+  #miniRect { position: absolute; border: 2px solid var(--accent); background: var(--accent-soft); pointer-events: none; }
+  #minimap.hidden { display: none; }
+
+  #hint { position: fixed; left: 14px; bottom: 14px; color: var(--muted); font-size: 12px; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; z-index: 5; max-width: 420px; }
+  #hint.hidden { display: none; }
+  kbd { font: 11px ui-monospace, Menlo, monospace; border: 1px solid var(--border); border-bottom-width: 2px;
+    border-radius: 4px; padding: 0 4px; background: var(--bg); }
+
+  @media (max-width: 980px) {
+    #search { width: 170px; }
+    #fitW, #dl { display: none; }
+  }
+  @media (max-width: 760px) {
+    #status, #hint, .wide { display: none !important; }
+    #search { width: 140px; }
+    #minimap { width: 160px; }
+  }
+</style>
+</head>
+<body>
+<div id="toolbar">
+  <button id="zoomOut" title="Отдалить (−)">−</button>
+  <button id="zoomLabel" title="Масштаб 100% (1)">100%</button>
+  <button id="zoomIn" title="Приблизить (+)">+</button>
+  <button id="fit" title="Вписать в экран (0)">Вписать</button>
+  <button id="fitW" class="wide" title="По ширине (W)">По ширине</button>
+  <span class="sep"></span>
+  <button id="miniBtn" class="on wide" title="Миникарта (M)">Миникарта</button>
+  <button id="themeBtn" class="wide" title="Тема">Тема</button>
+  <button id="dl" class="wide" title="Скачать SVG">SVG</button>
+  <span class="sep wide"></span>
+  <span id="status">Загрузка…</span>
+  <div id="searchWrap">
+    <input id="search" placeholder="Поиск узла  ( / )" autocomplete="off">
+    <div id="results"></div>
+  </div>
+</div>
+
+<div id="viewport"><div id="stage"></div></div>
+<div id="minimap"><div id="miniRect"></div></div>
+<div id="toast"></div>
+<div id="hint">
+  Прокрутка двумя пальцами — сдвиг, <kbd>Shift</kbd> + прокрутка или щипок — зум, двойной клик по фону — приблизить.
+  Клик по узлу подсвечивает его связи, <kbd>Esc</kbd> снимает.
+  <kbd>0</kbd> вписать, <kbd>1</kbd> 100%, <kbd>/</kbd> поиск.
+  <a href="#" id="hideHint">скрыть</a>
+</div>
+
+<script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs";
+
+// Схема всегда берется из ветки main репозитория
+const SRC = 'https://raw.githubusercontent.com/Nisakoo/Highload-TP/main/schemas/schema.mmd';
+const $ = (id) => document.getElementById(id);
+const viewport = $('viewport'), stage = $('stage'), minimap = $('minimap'), miniRect = $('miniRect');
+const store = {
+  get(k, d) { try { const v = localStorage.getItem('schemaViewer.' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem('schemaViewer.' + k, JSON.stringify(v)); } catch {} },
+};
+
+let view = { x: 0, y: 0, k: 1 };
+let size = { w: 1, h: 1 };
+let svgEl = null, lastSrc = null, renderSeq = 0, firstRender = true;
+let edges = [];          // {from, to, path, label}
+let nodeIndex = [];      // {name, text, el, kind}
+let theme = store.get('theme', 'auto');
+
+// ---------- Тема ----------
+function isDark() {
+  if (theme === 'dark') return true;
+  if (theme === 'light') return false;
+  return matchMedia('(prefers-color-scheme: dark)').matches;
+}
+function applyThemeAttr() {
+  if (theme === 'auto') document.documentElement.removeAttribute('data-theme');
+  else document.documentElement.setAttribute('data-theme', theme);
+  $('themeBtn').textContent = 'Тема: ' + ({ auto: 'авто', light: 'светлая', dark: 'темная' })[theme];
+}
+applyThemeAttr();
+
+// ---------- Рендер ----------
+async function render(src) {
+  const seq = ++renderSeq;
+  mermaid.initialize({ startOnLoad: false, maxEdges: 2000, maxTextSize: 500000,
+    theme: isDark() ? 'dark' : 'default', securityLevel: 'strict' });
+  let svg;
+  try {
+    ({ svg } = await mermaid.render('schema' + seq, src));
+  } catch (e) {
+    setStatus('Ошибка Mermaid: ' + (e.message || e).toString().split('\n')[0], true);
+    return;
+  }
+  if (seq !== renderSeq) return;
+  stage.innerHTML = svg;
+  svgEl = stage.querySelector('svg');
+  const vb = svgEl.getAttribute('viewBox').split(/[\s,]+/).map(Number);
+  size = { w: vb[2], h: vb[3] };
+  svgEl.removeAttribute('style');
+  svgEl.setAttribute('width', size.w);
+  svgEl.setAttribute('height', size.h);
+  indexGraph();
+  buildMinimap();
+  if (firstRender) { fit(); firstRender = false; } else apply();
+  clearFocus();
+  setStatus(`${nodeIndex.filter(n => n.kind === 'node').length} узлов, ${edges.length} связей · обновлено ${new Date().toLocaleTimeString()}`);
+}
+
+function indexGraph() {
+  edges = [];
+  const paths = [...svgEl.querySelectorAll('.edgePaths path.flowchart-link, path.flowchart-link')];
+  const uniq = [...new Set(paths)];
+  const labels = [...svgEl.querySelectorAll('.edgeLabels > g.edgeLabel, .edgeLabels > g')]
+    .filter((g, i, a) => a.indexOf(g) === i);
+  uniq.forEach((p, i) => {
+    const m = /^L_(.+)_(.+)_(\d+)$/.exec(p.id || '');
+    if (!m) return;
+    edges.push({ from: m[1], to: m[2], n: Number(m[3]), path: p, label: labels[i] || null });
+  });
+  nodeIndex = [];
+  svgEl.querySelectorAll('g.node').forEach(el => {
+    const m = /^flowchart-(.+)-\d+$/.exec(el.id || '');
+    if (!m) return;
+    el.dataset.name = m[1];
+    nodeIndex.push({ name: m[1], text: el.textContent.replace(/\s+/g, ' ').trim(), el, kind: 'node' });
+  });
+  svgEl.querySelectorAll('g.cluster').forEach(el => {
+    el.dataset.name = el.id;
+    const t = (el.querySelector('.cluster-label, .nodeLabel, text') || el).textContent.replace(/\s+/g, ' ').trim();
+    nodeIndex.push({ name: el.id, text: t, el, kind: 'cluster' });
+  });
+}
+
+function setStatus(t, err = false) { const s = $('status'); s.textContent = t; s.title = t; s.classList.toggle('err', err); }
+
+// ---------- Вид ----------
+const MAX_K = 4;
+let userMoved = false;
+function minK() { return Math.min(fitScale() * 0.5, 0.05); }
+function fitScale() {
+  const r = viewport.getBoundingClientRect();
+  return Math.max(0.005, Math.min((r.width - 40) / size.w, (r.height - 40) / size.h));
+}
+// Пока пользователь не двигал схему, держим ее вписанной (в том числе если страница грузилась в скрытой панели)
+new ResizeObserver(() => { if (svgEl && !userMoved) fit(); else updateMiniRect(); }).observe(viewport);
+['pointerdown', 'wheel', 'keydown'].forEach(t => addEventListener(t, () => { if (svgEl) userMoved = true; }, { capture: true }));
+function apply() {
+  stage.style.transform = `translate(${view.x}px, ${view.y}px) scale(${view.k})`;
+  $('zoomLabel').textContent = Math.round(view.k * 100) + '%';
+  updateMiniRect();
+}
+function zoomAt(k, cx, cy) {
+  k = Math.max(minK(), Math.min(MAX_K, k));
+  view.x = cx - (cx - view.x) * (k / view.k);
+  view.y = cy - (cy - view.y) * (k / view.k);
+  view.k = k;
+  apply();
+}
+function zoomCenter(f) { const r = viewport.getBoundingClientRect(); zoomAt(view.k * f, r.width / 2, r.height / 2); }
+function fit() {
+  const r = viewport.getBoundingClientRect();
+  const k = fitScale();
+  view = { k, x: (r.width - size.w * k) / 2, y: (r.height - size.h * k) / 2 };
+  apply();
+}
+function fitWidth() {
+  const r = viewport.getBoundingClientRect();
+  const k = Math.max(0.005, (r.width - 40) / size.w);
+  view = { k, x: 20, y: 20 };
+  apply();
+}
+function centerOn(svgX, svgY, k = view.k) {
+  userMoved = true;
+  const r = viewport.getBoundingClientRect();
+  view.k = Math.max(minK(), Math.min(MAX_K, k));
+  view.x = r.width / 2 - svgX * view.k;
+  view.y = r.height / 2 - svgY * view.k;
+  apply();
+}
+function animateTo(target, ms = 250) {
+  userMoved = true;
+  const from = { ...view }, t0 = performance.now();
+  const step = (t) => {
+    const p = Math.min(1, (t - t0) / ms), e = 1 - Math.pow(1 - p, 3);
+    view = { x: from.x + (target.x - from.x) * e, y: from.y + (target.y - from.y) * e, k: from.k + (target.k - from.k) * e };
+    apply();
+    if (p < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+function elementCenter(el) {
+  const b = el.getBBox();
+  const ctm = el.getCTM(), root = svgEl.getCTM();
+  // координаты в системе viewBox
+  const m = root.inverse().multiply(ctm);
+  const pt = svgEl.createSVGPoint();
+  pt.x = b.x + b.width / 2; pt.y = b.y + b.height / 2;
+  const p = pt.matrixTransform(m);
+  const vb = svgEl.viewBox.baseVal;
+  return { x: p.x - vb.x, y: p.y - vb.y, w: b.width, h: b.height };
+}
+function flyToFocus() {
+  const els = [...stage.querySelectorAll('g.node.hl, g.cluster.sel, .edgeLabels > g.hl')];
+  if (!els.length) return;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const el of els) {
+    const c = elementCenter(el);
+    x0 = Math.min(x0, c.x - c.w / 2); y0 = Math.min(y0, c.y - c.h / 2);
+    x1 = Math.max(x1, c.x + c.w / 2); y1 = Math.max(y1, c.y + c.h / 2);
+  }
+  const r = viewport.getBoundingClientRect(), pad = 60;
+  const k = Math.max(minK(), Math.min(1.2, (r.width - pad * 2) / (x1 - x0), (r.height - pad * 2) / (y1 - y0)));
+  const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+  animateTo({ k, x: r.width / 2 - cx * k, y: r.height / 2 - cy * k }, 350);
+}
+
+// ---------- Мышь / тач ----------
+let drag = null;
+const pointers = new Map();
+viewport.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0) return;
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (pointers.size === 1) drag = { sx: e.clientX, sy: e.clientY, vx: view.x, vy: view.y, moved: false, target: e.target };
+  else drag = null;
+});
+viewport.addEventListener('pointermove', (e) => {
+  if (!pointers.has(e.pointerId)) return;
+  const prev = pointers.get(e.pointerId);
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (pointers.size === 2) {
+    const [a, b] = [...pointers.values()];
+    const other = [...pointers.entries()].find(([id]) => id !== e.pointerId)[1];
+    const d0 = Math.hypot(prev.x - other.x, prev.y - other.y), d1 = Math.hypot(a.x - b.x, a.y - b.y);
+    const r = viewport.getBoundingClientRect();
+    if (d0 > 0) zoomAt(view.k * d1 / d0, (a.x + b.x) / 2 - r.left, (a.y + b.y) / 2 - r.top);
+    return;
+  }
+  if (!drag) return;
+  const dx = e.clientX - drag.sx, dy = e.clientY - drag.sy;
+  if (!drag.moved && Math.hypot(dx, dy) > 4) {
+    // Захватываем указатель только когда началось перетаскивание:
+    // иначе клики и двойные клики уходят на viewport, а не на подпись под курсором
+    drag.moved = true;
+    viewport.classList.add('panning');
+    try { viewport.setPointerCapture(e.pointerId); } catch {}
+  }
+  if (drag.moved) { view.x = drag.vx + dx; view.y = drag.vy + dy; apply(); }
+});
+function endPointer(e) {
+  pointers.delete(e.pointerId);
+  if (drag && !drag.moved && e.type === 'pointerup') handleClick(drag.target);
+  if (pointers.size === 0) drag = null;
+  viewport.classList.remove('panning');
+}
+addEventListener('pointerup', endPointer);
+addEventListener('pointercancel', endPointer);
+
+viewport.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const r = viewport.getBoundingClientRect();
+  const cx = e.clientX - r.left, cy = e.clientY - r.top;
+  const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? r.height : 1;
+  if (e.shiftKey) {
+    // Shift + прокрутка — зум. macOS при зажатом Shift превращает вертикальную прокрутку в горизонтальную,
+    // поэтому берем ту ось, по которой пришло больше.
+    const d = (Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : e.deltaX) * unit;
+    zoomAt(view.k * Math.exp(-d * 0.004), cx, cy);
+  } else if (e.ctrlKey) {
+    // Щипок на трекпаде
+    zoomAt(view.k * Math.exp(-e.deltaY * unit * 0.01), cx, cy);
+  } else {
+    // Прокрутка двумя пальцами — сдвиг по обеим осям
+    view.x -= e.deltaX * unit;
+    view.y -= e.deltaY * unit;
+    apply();
+  }
+}, { passive: false });
+
+viewport.addEventListener('dblclick', (e) => {
+  const r = viewport.getBoundingClientRect();
+  zoomAt(view.k * (e.shiftKey ? 1 / 2 : 2), e.clientX - r.left, e.clientY - r.top);
+});
+
+// ---------- Подсветка связей ----------
+let focused = null;
+function handleClick(target) {
+  const g = target.closest && target.closest('g.node, g.cluster');
+  if (!g || !g.dataset.name) { clearFocus(); return; }
+  if (focused === g.dataset.name) { clearFocus(); return; }
+  focusOn(g.dataset.name);
+}
+function focusOn(name) {
+  clearFocus();
+  focused = name;
+  stage.classList.add('focus');
+  const neigh = new Set([name]);
+  for (const e of edges) {
+    if (e.from === name || e.to === name) {
+      e.path.classList.add('hl');
+      e.label && e.label.classList.add('hl');
+      neigh.add(e.from); neigh.add(e.to);
+    }
+  }
+  for (const n of nodeIndex) {
+    if (neigh.has(n.name)) n.el.classList.add('hl');
+    if (n.name === name) n.el.classList.add('sel');
+  }
+  const cnt = edges.filter(e => e.from === name || e.to === name).length;
+  const item = nodeIndex.find(n => n.name === name);
+  setStatus(`${item ? item.text : name}: связей ${cnt}`);
+}
+function clearFocus() {
+  focused = null;
+  stage.classList.remove('focus');
+  stage.querySelectorAll('.hl, .sel').forEach(el => el.classList.remove('hl', 'sel'));
+}
+
+// ---------- Поиск ----------
+const search = $('search'), results = $('results');
+let hits = [], active = 0;
+function runSearch() {
+  const q = search.value.trim().toLowerCase();
+  if (!q) { results.style.display = 'none'; hits = []; return; }
+  hits = nodeIndex.filter(n => n.text.toLowerCase().includes(q) || n.name.toLowerCase().includes(q)).slice(0, 30);
+  active = 0;
+  results.innerHTML = '';
+  hits.forEach((h, i) => {
+    const d = document.createElement('div');
+    d.textContent = h.text || h.name;
+    const s = document.createElement('small'); s.textContent = h.kind === 'cluster' ? 'группа' : h.name;
+    d.appendChild(s);
+    d.addEventListener('mousedown', (ev) => { ev.preventDefault(); pick(i); });
+    results.appendChild(d);
+  });
+  if (!hits.length) results.innerHTML = '<div style="color:var(--muted);cursor:default">Ничего не найдено</div>';
+  results.style.display = 'block';
+  markActive();
+}
+function markActive() { [...results.children].forEach((d, i) => d.classList.toggle('active', i === active)); }
+function pick(i) {
+  const h = hits[i]; if (!h) return;
+  results.style.display = 'none';
+  search.blur();
+  focusOn(h.name);
+  flyToFocus();
+}
+search.addEventListener('input', runSearch);
+search.addEventListener('focus', runSearch);
+search.addEventListener('blur', () => setTimeout(() => results.style.display = 'none', 100));
+search.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowDown') { active = Math.min(hits.length - 1, active + 1); markActive(); e.preventDefault(); }
+  else if (e.key === 'ArrowUp') { active = Math.max(0, active - 1); markActive(); e.preventDefault(); }
+  else if (e.key === 'Enter') pick(active);
+  else if (e.key === 'Escape') { search.value = ''; runSearch(); search.blur(); }
+});
+
+// ---------- Миникарта ----------
+function buildMinimap() {
+  minimap.querySelectorAll('svg').forEach(s => s.remove());
+  const clone = svgEl.cloneNode(true);
+  clone.removeAttribute('width'); clone.removeAttribute('height');
+  // id оставляем: стили Mermaid привязаны к #id, без него миникарта теряет цвета
+  clone.querySelectorAll('.edgeLabels').forEach(n => n.remove());
+  minimap.insertBefore(clone, miniRect);
+  updateMiniRect();
+}
+function updateMiniRect() {
+  if (!svgEl) return;
+  const mw = minimap.clientWidth, s = mw / size.w;
+  const r = viewport.getBoundingClientRect();
+  let x = -view.x / view.k, y = -view.y / view.k, w = r.width / view.k, h = r.height / view.k;
+  const x0 = Math.max(0, x), y0 = Math.max(0, y);
+  const x1 = Math.min(size.w, x + w), y1 = Math.min(size.h, y + h);
+  Object.assign(miniRect.style, {
+    left: x0 * s + 'px', top: y0 * s + 'px',
+    width: Math.max(0, x1 - x0) * s + 'px', height: Math.max(0, y1 - y0) * s + 'px',
+  });
+}
+let miniDrag = false;
+function miniJump(e) {
+  const b = minimap.getBoundingClientRect(), s = b.width / size.w;
+  centerOn((e.clientX - b.left) / s, (e.clientY - b.top) / s);
+}
+minimap.addEventListener('pointerdown', (e) => { miniDrag = true; minimap.setPointerCapture(e.pointerId); miniJump(e); });
+minimap.addEventListener('pointermove', (e) => { if (miniDrag) miniJump(e); });
+minimap.addEventListener('pointerup', () => miniDrag = false);
+function setMini(on) { minimap.classList.toggle('hidden', !on); $('miniBtn').classList.toggle('on', on); store.set('mini', on); updateMiniRect(); }
+setMini(store.get('mini', true));
+
+// ---------- Кнопки и клавиши ----------
+$('zoomIn').onclick = () => zoomCenter(1.25);
+$('zoomOut').onclick = () => zoomCenter(0.8);
+$('zoomLabel').onclick = () => { const r = viewport.getBoundingClientRect(); zoomAt(1, r.width / 2, r.height / 2); };
+$('fit').onclick = fit;
+$('fitW').onclick = fitWidth;
+$('miniBtn').onclick = () => setMini(minimap.classList.contains('hidden'));
+$('themeBtn').onclick = () => {
+  theme = { auto: 'light', light: 'dark', dark: 'auto' }[theme];
+  store.set('theme', theme); applyThemeAttr();
+  if (lastSrc) render(lastSrc);
+};
+$('dl').onclick = () => {
+  if (!svgEl) return;
+  const blob = new Blob([new XMLSerializer().serializeToString(svgEl)], { type: 'image/svg+xml' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'schema.svg'; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+};
+$('hideHint').onclick = (e) => { e.preventDefault(); $('hint').classList.add('hidden'); store.set('hint', false); };
+if (!store.get('hint', true)) $('hint').classList.add('hidden');
+
+document.addEventListener('keydown', (e) => {
+  if (e.target.closest && e.target.closest('input, textarea')) return;
+  if (e.metaKey || e.ctrlKey) return;
+  else if (e.key === '/' ) { e.preventDefault(); search.focus(); search.select(); }
+  else if (e.key === '+' || e.key === '=') zoomCenter(1.25);
+  else if (e.key === '-' || e.key === '_') zoomCenter(0.8);
+  else if (e.key === '0') fit();
+  else if (e.key === '1') { const r = viewport.getBoundingClientRect(); zoomAt(1, r.width / 2, r.height / 2); }
+  else if (e.key === 'w' || e.key === 'W' || e.key === 'ц' || e.key === 'Ц') fitWidth();
+  else if (e.key === 'm' || e.key === 'M' || e.key === 'ь' || e.key === 'Ь') setMini(minimap.classList.contains('hidden'));
+  else if (e.key === 'Escape') clearFocus();
+  else if (e.key.startsWith('Arrow')) {
+    const step = 80;
+    if (e.key === 'ArrowLeft') view.x += step;
+    if (e.key === 'ArrowRight') view.x -= step;
+    if (e.key === 'ArrowUp') view.y += step;
+    if (e.key === 'ArrowDown') view.y -= step;
+    apply();
+  }
+});
+addEventListener('resize', () => updateMiniRect());
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { if (theme === 'auto' && lastSrc) render(lastSrc); });
+
+let toastTimer = null;
+function toast(text) {
+  const t = $('toast');
+  t.textContent = text;
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 1800);
+}
+
+// ---------- Загрузка и автообновление ----------
+async function load() {
+  try {
+    const r = await fetch(SRC, { cache: 'no-cache' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const t = await r.text();
+    if (t !== lastSrc) {
+      const external = lastSrc !== null;
+      lastSrc = t;
+      await render(t);
+      if (external) toast('Схема обновлена из репозитория');
+    }
+  } catch (e) {
+    setStatus('Не удалось загрузить схему: ' + e.message, true);
+  }
+}
+await load();
+// GitHub кэширует файл на 5 минут, поэтому чаще раза в минуту проверять незачем
+setInterval(load, 60000);
+</script>
+</body>
+</html>
