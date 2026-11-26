@@ -1098,7 +1098,7 @@ flowchart TB
     UPR -.->|"write: ответ саге"| KSAGA
 
     %% Синхронные вызовы генерации
-    GW --> PB
+    IR --> PB
     PB -->|"read/write: контекст"| CTXS
     PB -->|"read: вложения"| CEPH
     PB -->|"fallback: вложение без file-converter"| EXT
